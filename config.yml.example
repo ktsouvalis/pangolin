@@ -1,0 +1,127 @@
+# ============================================================
+#  UoP Pangolin HA Cluster Monitor — Site Configuration
+#  Copy to config.yml and fill in your values.
+# ============================================================
+
+site_name: "UoP Pangolin HA Cluster"
+
+# Set to false if your terminal renders ● as underscores (common in Proxmox CTs without UTF-8 locale)
+# Omit or set to true to auto-detect from locale env vars (LANG/LC_ALL/LC_CTYPE)
+unicode_bullets: true
+
+# Auto-refresh interval in seconds (used by monitor.py)
+refresh_interval: 20
+
+# HTTP and timeout settings
+http_timeout: 5
+redis_timeout: 3
+
+# VIP managed by keepalived across nodes 1-3
+vip: "<VIP_IP>"
+
+# Network interface keepalived runs on
+vrrp_interface: "ens18"
+
+nodes:
+  pangolin:
+    - ip: "<NODE1_IP>"
+      name: "pangolin-node-1"
+    - ip: "<NODE2_IP>"
+      name: "pangolin-node-2"
+    - ip: "<NODE3_IP>"
+      name: "pangolin-node-3"
+
+  patroni:
+    - ip: "<NODE1_IP>"
+      name: "pangolin-node-1"
+    - ip: "<NODE2_IP>"
+      name: "pangolin-node-2"
+    - ip: "<NODE3_IP>"
+      name: "pangolin-node-3"
+
+  etcd:
+    - ip: "<NODE1_IP>"
+      name: "pangolin-node-1"
+    - ip: "<NODE2_IP>"
+      name: "pangolin-node-2"
+    - ip: "<NODE3_IP>"
+      name: "pangolin-node-3"
+
+  haproxy:
+    - ip: "<NODE1_IP>"
+      name: "pangolin-node-1"
+    - ip: "<NODE2_IP>"
+      name: "pangolin-node-2"
+    - ip: "<NODE3_IP>"
+      name: "pangolin-node-3"
+
+ports:
+  pangolin:        3001    # Pangolin API
+  patroni:         8008    # Patroni REST API
+  haproxy_primary: 5000    # HAProxy → PostgreSQL primary (read-write)
+  haproxy_replica: 5001    # HAProxy → PostgreSQL replicas (read-only)
+  haproxy_stats:   9000    # HAProxy stats page
+  etcd:            2379    # etcd client API
+  postgres:        5432    # PostgreSQL direct
+
+ssh:
+  username: "<SSH_USERNAME>"
+  key_file: "~/.ssh/id_ed25519"
+
+# Services to collect logs from (used by logs_viewer.py)
+# type: "docker" (container name) or "systemd" (unit name)
+# nodes: key from the nodes/keepalived sections above
+services:
+  - label: "Pangolin"
+    nodes: pangolin
+    type: docker
+    container: "pangolin"
+
+  - label: "Gerbil"
+    nodes: pangolin
+    type: docker
+    container: "gerbil"
+
+  - label: "Traefik"
+    nodes: pangolin
+    type: docker
+    container: "traefik"
+
+  - label: "Patroni"
+    nodes: patroni
+    type: systemd
+    unit: "patroni"
+
+  - label: "etcd"
+    nodes: etcd
+    type: docker
+    container: "etcd"
+
+  - label: "HAProxy"
+    nodes: haproxy
+    type: docker
+    container: "haproxy"
+
+  - label: "Keepalived"
+    nodes: keepalived
+    type: systemd
+    unit: "keepalived"
+
+credentials:
+  # HAProxy stats has no authentication in this deployment
+  postgres_user:      "postgres"
+  postgres_password:  "<POSTGRES_PASSWORD>"
+  postgres_db:        "pangolin"
+
+keepalived:
+  track_weight: -25
+  nodes:
+    - ip: "<NODE1_IP>"
+      name: "pangolin-node-1"
+      base_priority: 100
+    - ip: "<NODE2_IP>"
+      name: "pangolin-node-2"
+      base_priority: 90
+    - ip: "<NODE3_IP>"
+      name: "pangolin-node-3"
+      base_priority: 80
