@@ -517,8 +517,10 @@ class HAProxyPanel(Static):
                 err_str = f"[red]5xx:{errs}[/]" if errs > 0 else "[dim]5xx:0[/]"
                 parts.append(f"[cyan]{pxname}[/]: {ups}/{total} {rate}/s {err_str}")
             summary = "  ".join(parts) if parts else "[dim]no backends[/]"
-            d_dot   = DOWN if any_zero else OK
-            color   = "red" if any_zero else "green"
+            # Use WARN (yellow) when a backend has 0 UP servers — the HAProxy
+            # node itself is reachable so DOWN would be misleading. In a
+            # Patroni setup, partial UP counts are role-based and expected.
+            d_dot, color = (WARN, "yellow") if any_zero else (OK, "green")
             lines.append(f"  {d_dot} [bold {color}]{name:<18}[/] {summary}")
         return "\n".join(lines)
 
