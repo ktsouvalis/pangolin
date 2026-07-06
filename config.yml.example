@@ -55,6 +55,18 @@ nodes:
     - ip: "<NODE3_IP>"
       name: "pangolin-node-3"
 
+  newt:
+    ssh:
+      username: "root"
+      key_file: "path_to_key"
+    hosts:
+      - ip: "<newt1_IP>"
+        name: "patra"
+      - ip: "<newt2_IP>"
+        name: "kalamata"
+      - ip: "<newt3_IP>"
+        name: "tripoli"
+
 ports:
   pangolin:        3001    # Pangolin API
   patroni:         8008    # Patroni REST API
@@ -106,6 +118,11 @@ services:
     nodes: keepalived
     type: systemd
     unit: "keepalived"
+
+  - label: "Newt"
+    nodes: newt
+    type: docker
+    container: "newt"
 
 credentials:
   # HAProxy stats has no authentication in this deployment

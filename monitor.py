@@ -28,6 +28,7 @@ except ImportError:
 import yaml
 import requests
 import urllib3
+import paramiko
 
 from textual.app import App, ComposeResult
 from textual.widgets import Static, Footer
@@ -69,6 +70,21 @@ ETCD_NODES     = NODES.get("etcd",     [])
 HAPROXY_NODES  = NODES.get("haproxy",  [])
 KA_NODES       = KA_CFG.get("nodes",   [])
 TRACK_WEIGHT   = int(KA_CFG.get("track_weight", -25))
+
+# Newt agent group may be a dict with its own ssh override:
+# {"ssh": {...}, "hosts": [...]}  instead of a plain list — mirrors the
+# shape used in logs_viewer.py's config.yml.
+_newt_raw = NODES.get("newt", [])
+if isinstance(_newt_raw, dict):
+    NEWT_NODES = _newt_raw.get("hosts", [])
+    _newt_ssh_override = _newt_raw.get("ssh", {})
+else:
+    NEWT_NODES = _newt_raw
+    _newt_ssh_override = {}
+
+_global_ssh = CFG.get("ssh", {})
+NEWT_SSH_USER = _newt_ssh_override.get("username", _global_ssh.get("username", ""))
+NEWT_SSH_KEY  = _newt_ssh_override.get("key_file", _global_ssh.get("key_file", "~/.ssh/id_ed25519"))
 
 P_PANGOLIN = int(PORTS.get("pangolin",        3001))
 P_PATRONI  = int(PORTS.get("patroni",         8008))
@@ -281,6 +297,28 @@ def check_postgres_node(node: dict) -> dict:
         return {"ip": ip, "name": name, "ok": True, "is_replica": is_replica}
     except Exception as e:
         return {"ip": ip, "name": name, "ok": False, "error": str(e)}
+
+
+def check_newt_node(node: dict) -> dict:
+    """Simple reachability check for a Newt agent host: attempt an SSH
+    connection using the group's credentials (per-group override or the
+    global ssh: block), and report up/down only — no container inspection."""
+    ip   = node["ip"]
+    name = node.get("name", ip)
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            ip,
+            username=NEWT_SSH_USER,
+            key_filename=os.path.expanduser(NEWT_SSH_KEY),
+            timeout=HTTP_TIMEOUT,
+            auth_timeout=HTTP_TIMEOUT,
+        )
+        client.close()
+        return {"ip": ip, "name": name, "reachable": True, "error": ""}
+    except Exception as e:
+        return {"ip": ip, "name": name, "reachable": False, "error": str(e)[:60]}
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +595,30 @@ class PostgreSQLPanel(Static):
         self.update(self.render_content())
 
 
+class NewtPanel(Static):
+    """Simple up/down reachability panel for the Newt agent hosts
+    (Patra/Kalamata/Tripoli). Checked via SSH connect attempt only —
+    no container-level inspection, per the agreed scope."""
+    data: reactive[list] = reactive([])
+
+    def render_content(self) -> str:
+        if not self.data:
+            return "  [dim]Checking...[/]"
+        lines = []
+        for node in self.data:
+            name = node["name"]
+            ok   = node.get("reachable", False)
+            if ok:
+                lines.append(f"  {OK} [bold green]{name:<18}[/] [green]REACHABLE[/]")
+            else:
+                err = node.get("error", "")
+                lines.append(f"  {DOWN} [bold red]{name:<18}[/] [red]UNREACHABLE[/]  [dim]{err}[/]")
+        return "\n".join(lines)
+
+    def watch_data(self, data: list) -> None:
+        self.update(self.render_content())
+
+
 class StatusBar(Static):
     last_refresh: reactive[str] = reactive("")
     status_dot:   reactive[str] = reactive(GREY)
@@ -655,6 +717,11 @@ class ClusterMonitor(App):
             yield EtcdPanel("  [dim]Checking...[/]",
                             id="panel-etcd", classes="panel")
 
+        # Row 5: Newt agents (full width) — simple reachability only
+        if NEWT_NODES:
+            yield NewtPanel("  [dim]Checking...[/]",
+                            id="panel-newt", classes="panel")
+
         yield Footer()
 
     def on_mount(self) -> None:
@@ -663,6 +730,8 @@ class ClusterMonitor(App):
         self.query_one("#panel-haproxy").border_title    = f" {GREY}  HAPROXY BACKENDS  "
         self.query_one("#panel-patroni").border_title    = f" {GREY}  POSTGRESQL / PATRONI  "
         self.query_one("#panel-etcd").border_title       = f" {GREY}  ETCD CLUSTER  "
+        if NEWT_NODES:
+            self.query_one("#panel-newt").border_title   = f" {GREY}  NEWT AGENTS  "
 
         self.set_interval(REFRESH_INTERVAL, self.action_refresh_now)
         self.action_refresh_now()
@@ -677,6 +746,7 @@ class ClusterMonitor(App):
             f_patroni  = [ex.submit(check_patroni_node,    n) for n in PATRONI_NODES]
             f_etcd     = [ex.submit(check_etcd_node,       n) for n in ETCD_NODES]
             f_haproxy  = [ex.submit(check_haproxy_node,    n) for n in HAPROXY_NODES]
+            f_newt     = [ex.submit(check_newt_node,       n) for n in NEWT_NODES]
 
             vip_data      = f_vip.result()
             ka_data       = [f.result() for f in f_ka]
@@ -685,6 +755,7 @@ class ClusterMonitor(App):
             patroni_data  = [f.result() for f in f_patroni]
             etcd_data     = [f.result() for f in f_etcd]
             haproxy_data  = [f.result() for f in f_haproxy]
+            newt_data     = [f.result() for f in f_newt]
 
             # Patroni history from the current leader
             primary = next(
@@ -704,14 +775,14 @@ class ClusterMonitor(App):
             self._apply_updates,
             vip_data, ka_data, combined_pangolin,
             patroni_data, history_data,
-            etcd_data, haproxy_data, ts,
+            etcd_data, haproxy_data, newt_data, ts,
         )
 
     def _apply_updates(
         self,
         vip_data, ka_data, pangolin_data,
         patroni_data, history_data,
-        etcd_data, haproxy_data, ts,
+        etcd_data, haproxy_data, newt_data, ts,
     ):
         self.query_one("#panel-keepalived", KeepalivedPanel).data = {
             "vip": vip_data, "nodes": ka_data,
@@ -722,6 +793,8 @@ class ClusterMonitor(App):
         }
         self.query_one("#panel-etcd",      EtcdPanel).data      = etcd_data
         self.query_one("#panel-haproxy",   HAProxyPanel).data   = haproxy_data
+        if NEWT_NODES:
+            self.query_one("#panel-newt", NewtPanel).data = newt_data
 
         # --- failure counts ---
         ka_fail       = sum(1 for n in ka_data       if not n["pangolin_up"])
@@ -729,6 +802,7 @@ class ClusterMonitor(App):
         patroni_fail  = sum(1 for n in patroni_data   if not n["ok"])
         etcd_fail     = sum(1 for n in etcd_data      if not n["ok"])
         haproxy_fail  = sum(1 for n in haproxy_data   if not n["ok"])
+        newt_fail     = sum(1 for n in newt_data      if not n.get("reachable", False))
 
         # --- border title dots ---
         self.query_one("#panel-keepalived").border_title = (
@@ -763,9 +837,15 @@ class ClusterMonitor(App):
         self.query_one("#panel-etcd").border_title = (
             f" {failures_to_dot(etcd_fail)}  ETCD CLUSTER  "
         )
+        if NEWT_NODES:
+            self.query_one("#panel-newt").border_title = (
+                f" {failures_to_dot(newt_fail)}  NEWT AGENTS  "
+            )
 
         # --- central dot ---
         all_failures = [ka_fail, pangolin_fail, patroni_fail, etcd_fail, haproxy_fail]
+        if NEWT_NODES:
+            all_failures.append(newt_fail)
         if any(f >= 3 for f in all_failures):
             central_dot = DOWN
         elif any(f >= 2 for f in all_failures):
