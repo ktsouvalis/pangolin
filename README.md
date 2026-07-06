@@ -20,6 +20,7 @@ Built with [Textual](https://textual.textualize.io/). No agents, no daemons — 
 | **HAProxy backends** | Parses `/stats;csv` — shows per-backend UP/DOWN count, request rate, 5xx errors per node |
 | **PostgreSQL / Patroni** | `GET http://<node>:8008/` — role (LEADER/REPLICA), state, timeline, replication lag, last failover |
 | **etcd** | `GET http://<node>:2379/health` + `/v3/maintenance/status` — health, leader, raft term, DB size |
+| **Newt agents** | SSH connect attempt only (no container inspection) — reachable/unreachable per host. Panel only appears if `nodes.newt` is configured |
 
 ---
 
@@ -115,7 +116,10 @@ Node tabs across the top; service sub-tabs within each node. Results stream in p
 ```bash
 python3 logs_viewer.py
 python3 logs_viewer.py --config /path/to/config.yml
+python3 logs_viewer.py --last 6      # override lookback window (hours) for both WARN/ERROR and Newt access logs
 ```
+
+If any node in the `newt` group is configured, an extra **Access Logs** sub-tab appears per node showing parsed `ACCESS START`/`END` session pairs (last 7 days by default), resolved against the Pangolin database into user/client/resource names.
 
 Key bindings:
 
@@ -131,7 +135,10 @@ Fetches all logs and writes a structured plain-text `.log` file — no TUI is sh
 ```bash
 python3 logs_viewer.py --save cluster_logs
 # writes: cluster_logs.log
+# if a "newt" node group is configured, also writes: cluster_logs_newt.csv
 ```
+
+The `_newt.csv` file contains resolved Newt ACCESS sessions (who connected, to which resource, proto, duration) for the last 7 days — pulled from Newt's Docker logs and cross-referenced against the Pangolin database (`sites`, `clients`, `siteResources` tables).
 
 Output format:
 
@@ -187,3 +194,4 @@ services:
 - `config.yml` is git-ignored — never commit it; it contains credentials.
 - Set `unicode_bullets: false` in `config.yml` if your terminal renders `●` as underscores (common in Proxmox CTs without a UTF-8 locale).
 - Keepalived health is inferred from the Pangolin API: if Pangolin is reachable on a node, its VRRP priority stays at `base_priority`; otherwise `track_weight` is applied.
+- The `nodes.newt` group may use its own SSH credentials instead of the global `ssh:` block — write it as `{ssh: {username, key_file}, hosts: [...]}` instead of a plain list. Useful when Newt hosts (e.g. remote sites) aren't reachable with the same key/user as the cluster nodes.
