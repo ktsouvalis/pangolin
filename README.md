@@ -250,14 +250,17 @@ python3 create_private_resources.py my_requests.xlsx
 python3 create_private_resources.py my_requests.xlsx --config /path/to/config.yml
 ```
 
-Requests sheet columns: `Name | Destination (IP or CIDR) | Alias | TCP Ports | UDP Ports | ICMP | User Emails | Notes`
+Requests sheet columns: `Name | Operation System | Destination (IP or CIDR) | Alias | User Emails | Notes`
 
-- **TCP/UDP Ports**: `all` → every port, `blocked` (or empty) → protocol fully blocked, or a custom list (`80,443` / `8000-9000,443`).
+- **Operation System**: `Linux` or `Windows`. Drives a fixed TCP port policy — UDP and ICMP are always blocked, not user-configurable:
+  - `Linux` → TCP `22,3389`
+  - `Windows` → TCP `23579`
+  - Any other/blank value fails that row locally (no API call) rather than guessing a port policy.
 - **Destination**: a single IP is created as a `host` resource; a CIDR (e.g. `10.23.30.0/24`) as a `network` resource.
 - **Alias**: optional FQDN (e.g. `app.internal`) to reach the resource by name instead of IP. Doesn't apply to CIDR rows; leave blank otherwise.
 - **User Emails**: comma-separated university emails, resolved against the org's user list. Access is granted **only** to these users (`roleIds` is always empty — no role-based access). Unresolved emails are reported as warnings, never silently dropped.
 
-Every run writes a `<input>_results_<timestamp>.xlsx` report next to the input file with a `Status` per site-resource (OK / FAIL / DRY-RUN), the created `siteResourceId`/`niceId`, the `Sites` it spans, and any unresolved emails or API errors.
+Every run writes a `<input>_results_<timestamp>.xlsx` report next to the input file: the request contents (Name, Destination, Alias, OS, User Emails, Notes) plus `Sites` it spans, `Status` per site-resource (OK / FAIL / DRY-RUN), the created `niceId`, a `Timestamp` of the creation/attempt, and any unresolved emails or errors.
 
 Filled-in request and report `.xlsx` files are git-ignored (only `*template.xlsx` is tracked) since they carry real internal IPs and emails.
 

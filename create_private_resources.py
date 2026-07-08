@@ -12,18 +12,18 @@ Config (config.yml, key-value, nested under 'pangolin'):
       api_key: "..."
 
 Requests sheet columns (see pangolin_private_resources_template.xlsx):
-    Name | Destination (IP or CIDR) | Alias | TCP Ports | UDP Ports | ICMP | User Emails | Notes
+    Name | Destination (IP or CIDR) | Alias | OS | User Emails | Notes
 
 Alias: optional FQDN (e.g. "app.internal") to reach the resource by name instead
        of IP. Not applicable when Destination is a CIDR range; left blank most
        of the time.
 
-TCP/UDP Ports values:
-    "all"      -> "*"   (every port)
-    "blocked"  -> ""    (protocol fully blocked)
-    anything else used as-is (e.g. "80,443" or "8000-9000,443")
+OS drives a fixed TCP port policy (UDP and ICMP are always blocked):
+    "Linux"    -> TCP 22,3389
+    "Windows"  -> TCP 23579
+Any other/blank value fails that row locally (no API call) rather than
+guessing a port policy.
 
-ICMP values: "Enabled" / "Disabled"
 User Emails: comma-separated; each resolved to a user ID (unresolved emails are
              reported as warnings and never silently dropped from the report).
 
@@ -103,23 +103,24 @@ def build_user_index(cfg):
     return index
 
 
-def port_string(value):
-    v = (value or "").strip().lower()
-    if v == "all":
-        return "*"
-    if v in ("blocked", ""):
-        return ""
-    return value.strip()
+# Fixed port policy keyed by the "Operation System" column. UDP and ICMP are
+# always blocked, so they're not user-configurable inputs (see CLAUDE.md).
+OS_TCP_PORTS = {
+    "linux": "22,3389",
+    "windows": "23579",
+}
 
 
 def parse_row(row_num, row, user_index):
-    name, destination, alias, tcp, udp, icmp, emails, notes = row
+    name, os_value, destination, alias, emails, notes = row
     if not destination:
         return None
 
     destination = str(destination).strip()
     mode = "cidr" if "/" in destination else "host"
     alias = str(alias).strip() if alias else None
+    os_display = str(os_value).strip() if os_value else ""
+    tcp_ports = OS_TCP_PORTS.get(os_display.lower())
 
     resolved_users, unresolved = [], []
     for raw_email in str(emails or "").split(","):
@@ -136,14 +137,17 @@ def parse_row(row_num, row, user_index):
         "name": (str(name).strip() if name else destination),
         "mode": mode,
         "destination": destination,
-        "tcpPortRangeString": port_string(tcp),
-        "udpPortRangeString": port_string(udp),
-        "disableIcmp": str(icmp or "").strip().lower() == "disabled",
+        "os": os_display,
+        "tcpPortRangeString": tcp_ports or "",
+        "udpPortRangeString": "",
+        "disableIcmp": True,
         "roleIds": [],
         "clientIds": [],
         "userIds": resolved_users,
         "_unresolved_emails": unresolved,
-        "_notes": notes,
+        "_notes": str(notes).strip() if notes else None,
+        "_raw_emails": str(emails).strip() if emails else None,
+        "_os_error": tcp_ports is None,
     }
     if alias:
         req["alias"] = alias
@@ -151,7 +155,7 @@ def parse_row(row_num, row, user_index):
 
 
 def create_site_resource(cfg, sites, req, dry_run):
-    payload = {k: v for k, v in req.items() if not k.startswith("_")}
+    payload = {k: v for k, v in req.items() if not k.startswith("_") and k != "os"}
     payload["siteIds"] = [s["siteId"] for s in sites]
     site_names = ", ".join(s["name"] for s in sites)
 
@@ -160,14 +164,23 @@ def create_site_resource(cfg, sites, req, dry_run):
         "name": req["name"],
         "destination": req["destination"],
         "alias": req.get("alias"),
+        "os": req["os"],
+        "emails": req["_raw_emails"],
+        "notes": req["_notes"],
         "sites": site_names,
         "status": None,
-        "site_resource_id": None,
         "nice_id": None,
-        "http_status": None,
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "error": None,
         "unresolved_emails": ", ".join(req["_unresolved_emails"]) or None,
     }
+
+    if req["_os_error"]:
+        msg = f"invalid/missing OS {req['os']!r} (expected 'Linux' or 'Windows')"
+        print(f"  [FAIL] {msg}")
+        result["status"] = "FAIL"
+        result["error"] = msg
+        return result
 
     if dry_run:
         print(f"  [DRY-RUN] {payload}")
@@ -176,17 +189,15 @@ def create_site_resource(cfg, sites, req, dry_run):
 
     resp = session.put(f"{cfg['base_url']}/v1/org/{cfg['org_slug']}/site-resource",
                         headers=api_headers(cfg), json=payload)
-    result["http_status"] = resp.status_code
 
     if resp.status_code >= 400:
         print(f"  [FAIL] {resp.status_code}: {resp.text}")
         result["status"] = "FAIL"
-        result["error"] = resp.text[:500]
+        result["error"] = f"{resp.status_code}: {resp.text[:500]}"
         return result
 
     body = resp.json()["data"]
     result["status"] = "OK"
-    result["site_resource_id"] = body["siteResourceId"]
     result["nice_id"] = body["niceId"]
     print(f"  [OK] siteResourceId={body['siteResourceId']} niceId={body['niceId']} "
           f"sites=[{site_names}]")
@@ -199,8 +210,8 @@ def write_report(input_path, results):
         del wb["Results"]
     ws = wb.create_sheet("Results")
 
-    headers = ["Row", "Name", "Destination", "Alias", "Sites", "Status",
-               "Site Resource ID", "Nice ID", "HTTP Status", "Unresolved Emails", "Error"]
+    headers = ["Row", "Name", "Destination", "Alias", "OS", "User Emails", "Notes", "Sites",
+               "Status", "Nice ID", "Timestamp", "Unresolved Emails", "Error"]
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
 
@@ -218,17 +229,18 @@ def write_report(input_path, results):
 
     for r, res in enumerate(results, start=2):
         values = [
-            res["row_num"], res["name"], res["destination"], res["alias"], res["sites"],
-            res["status"], res["site_resource_id"], res["nice_id"], res["http_status"],
+            res["row_num"], res["name"], res["destination"], res["alias"], res["os"],
+            res["emails"], res["notes"], res["sites"],
+            res["status"], res["nice_id"], res["timestamp"],
             res["unresolved_emails"], res["error"],
         ]
         for c, v in enumerate(values, start=1):
             ws.cell(row=r, column=c, value=v)
         fill_color = status_colors.get(res["status"])
         if fill_color:
-            ws.cell(row=r, column=6).fill = PatternFill("solid", fgColor=fill_color)
+            ws.cell(row=r, column=9).fill = PatternFill("solid", fgColor=fill_color)
 
-    widths = [6, 22, 22, 22, 30, 10, 16, 26, 12, 30, 40]
+    widths = [6, 22, 22, 22, 10, 26, 30, 30, 10, 26, 18, 30, 40]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
 
@@ -262,7 +274,7 @@ def main():
 
     wb = load_workbook(args.xlsx_path, data_only=True)
     ws = wb[args.sheet]
-    raw_rows = list(ws.iter_rows(min_row=2, max_col=8, values_only=True))
+    raw_rows = list(ws.iter_rows(min_row=2, max_col=6, values_only=True))
 
     requests_parsed = []
     for i, row in enumerate(raw_rows, start=2):
@@ -278,9 +290,9 @@ def main():
     for req in requests_parsed:
         print(f"- row {req['_row_num']}: {req['name']} ({req['mode']}: {req['destination']}) "
               f"alias={req.get('alias') or '-'} "
+              f"os={req['os'] or '-'} "
               f"tcp={req['tcpPortRangeString'] or 'blocked'} "
-              f"udp={req['udpPortRangeString'] or 'blocked'} "
-              f"icmp={'disabled' if req['disableIcmp'] else 'enabled'}")
+              f"udp=blocked icmp=blocked")
         if req["_unresolved_emails"]:
             print(f"  [WARN] unresolved email(s): {req['_unresolved_emails']}")
         all_results.append(create_site_resource(cfg, sites, req, args.dry_run))

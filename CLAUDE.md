@@ -15,7 +15,7 @@ Both TUI scripts read the same `config.yml` (see `config.yml.example` for the sc
 ## Layout
 
 - `monitor.py`, `logs_viewer.py`, `create_private_resources.py` — the three tools, no other source files.
-- `pangolin_private_resources_template.xlsx` — the request-sheet template for `create_private_resources.py` (columns: Name, Destination, Alias, TCP Ports, UDP Ports, ICMP, User Emails, Notes; see its own instructions tab — currently in Greek, "Οδηγίες"). Filled-in request/report xlsx files are git-ignored (`*.xlsx` except `*template.xlsx`) since they carry real internal IPs/emails — don't fight that with `git add -f`.
+- `pangolin_private_resources_template.xlsx` — the request-sheet template for `create_private_resources.py` (columns, in this exact order since the script parses by position not header name: Name, Operation System, Destination, Alias, User Emails, Notes; see its own instructions tab — currently in Greek, "Οδηγίες"). Filled-in request/report xlsx files are git-ignored (`*.xlsx` except `*template.xlsx`) since they carry real internal IPs/emails — don't fight that with `git add -f`.
 - `config.yml.example` — schema reference; `config.yml` is the real, git-ignored, credential-bearing file.
 - `requirements.txt` — pinned deps (note: `redis` is listed and `redis_timeout` exists in the config schema, but no code currently uses redis — leftover, not a bug to "fix" by wiring it up).
 - No tests, no CI, no linter config.
@@ -46,6 +46,7 @@ Each Pangolin node's `config.yml`/`dynamic_config.yml` are independent, per-node
 - Panels in `monitor.py` are conditionally shown only when their node group is non-empty (see `if NEWT_NODES:` in `compose`/`on_mount`/`_apply_updates`) — new optional panels should follow that pattern rather than always rendering.
 - `README.md` is the user-facing doc; keep it in sync when adding panels, CLI flags, or output files (e.g. the `_newt.csv` side-output from `--save` mode).
 - `create_private_resources.py` always sends `roleIds: []` and grants access only via resolved `userIds` — that's deliberate (per-resource, email-based allowlists, no role-based access), not a gap to fill in.
+- `create_private_resources.py`'s port policy is derived from the request sheet's `Operation System` column (`Linux` → TCP `22,3389`, `Windows` → TCP `23579`), not user-entered TCP/UDP/ICMP values — UDP and ICMP are always blocked for every resource. This is a deliberate director-mandated policy (as of 2026-07-08), not an oversight; don't reintroduce manual per-row port/ICMP columns without being asked. An unrecognized/blank OS value fails that row locally before any API call.
 - `create_private_resources.py` only supports creating site resources today — updating an existing one (e.g. looked up by the `niceId` shown in a prior Results sheet) is a planned TODO (see the comment above `main()`). Note the API's update/delete routes are keyed by the numeric `siteResourceId`, not `niceId` — a niceId-based `--update` mode would need to resolve niceId → siteResourceId first via `GET /org/{orgId}/site-resources`.
 
 ## Environment
