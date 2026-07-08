@@ -5,6 +5,19 @@
 
 site_name: "UoP Pangolin HA Cluster"
 
+# Used by create_private_resources.py
+# base_url must point at Pangolin's Integration API (a separate opt-in
+# service — see https://docs.pangolin.net for "Enable Integration API"),
+# not the dashboard frontend on the same domain. The script appends /v1/...
+# to it. This deployment exposes it via Traefik at the /int-api path
+# (see config/traefik/dynamic_config.yml on the Pangolin nodes) rather than
+# the docs' example subdomain, to avoid needing separate DNS/TLS.
+pangolin:
+  base_url: "https://your-domain/int-api"
+  org_slug: "your_org_id"
+  api_key: "your_api_key"
+
+
 # Set to false if your terminal renders ● as underscores (common in Proxmox CTs without UTF-8 locale)
 # Omit or set to true to auto-detect from locale env vars (LANG/LC_ALL/LC_CTYPE)
 unicode_bullets: true

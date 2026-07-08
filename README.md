@@ -1,11 +1,12 @@
 # pangolin-utils
 
-A pair of TUI tools for the **Pangolin HA Cluster**:
+A set of tools for the **Pangolin HA Cluster**:
 
 | Script | Purpose |
 |---|---|
-| `monitor.py` | Real-time dashboard — polls every 20 s, one panel per service |
-| `logs_viewer.py` | Log viewer — fetches warnings/errors from all nodes via SSH |
+| `monitor.py` | Real-time TUI dashboard — polls every 20 s, one panel per service |
+| `logs_viewer.py` | TUI log viewer — fetches warnings/errors from all nodes via SSH |
+| `create_private_resources.py` | CLI — batch-creates private (site) resources from a filled-in xlsx request sheet; each row becomes one resource spanning every site for HA |
 
 Built with [Textual](https://textual.textualize.io/). No agents, no daemons — runs from any workstation that can reach the cluster network.
 
@@ -46,6 +47,7 @@ Built with [Textual](https://textual.textualize.io/). No agents, no daemons — 
 - etcd HTTP API accessible (port 2379)
 - HAProxy stats endpoint enabled (port 9000)
 - SSH key access to all nodes (for `logs_viewer.py`)
+- Pangolin **Integration API** enabled + an org API key (for `create_private_resources.py` — see below, this is a separate opt-in feature from the dashboard)
 
 ---
 
@@ -92,6 +94,14 @@ python3 monitor.py
 Or specify a custom config file:
 ```bash
 python3 monitor.py /path/to/config.yml
+```
+
+`create_private_resources.py` additionally needs a `pangolin:` block in `config.yml` (API access, not cluster monitoring). `base_url` must point at Pangolin's **Integration API**, not the dashboard — this is a separate opt-in service that must be enabled server-side first (see "Private resource creation" below):
+```yaml
+pangolin:
+  base_url: "https://pangolin.uop.gr/int-api"
+  org_slug: "your-org-slug"
+  api_key: "..."
 ```
 
 ---
@@ -186,6 +196,72 @@ services:
 - SSH access to all cluster nodes (username + key configured under `ssh:` in `config.yml`)
 - Docker CLI available on each node (`docker logs`)
 - `systemd` / `journalctl` available on nodes running bare-metal services
+
+---
+
+## Private resource creation (create_private_resources.py)
+
+Batch-creates Pangolin private (site) resources from a filled-in xlsx request sheet. Each row becomes **one** site resource spanning **every site in the org** (via the API's `siteIds` array), so it's reachable through any site's tunnel for HA. Not a TUI — plain CLI, prints progress to stdout.
+
+### One-time server-side setup: enabling the Integration API
+
+This script talks to Pangolin's **Integration API**, a separate opt-in service — not the dashboard's own internal API. It must be enabled per-node before this script (or any Bearer-token API access) will work at all:
+
+1. In each Pangolin node's own `config.yml` (`/opt/pangolin/config/config.yml` inside the `pangolin` container — **not** this repo's `config.yml`), add:
+   ```yaml
+   flags:
+       enable_integration_api: true
+   server:
+       integration_port: 3003   # default
+   ```
+2. In each node's Traefik `dynamic_config.yml`, add a router exposing that port. This cluster reuses the existing `pangolin.uop.gr` domain/cert via a `/int-api` path prefix (with a `stripPrefix` middleware) rather than provisioning a new subdomain:
+   ```yaml
+   middlewares:
+     int-api-stripprefix:
+       stripPrefix:
+         prefixes: ["/int-api"]
+   routers:
+     int-api-router:
+       rule: "Host(`pangolin.uop.gr`) && PathPrefix(`/int-api`)"
+       service: int-api-service
+       entryPoints: [websecure]
+       middlewares: [int-api-stripprefix, badger]
+       tls:
+         certResolver: letsencrypt
+   services:
+     int-api-service:
+       loadBalancer:
+         servers:
+           - url: "http://127.0.0.1:3003"
+   ```
+3. Restart the `pangolin` and `traefik` containers on that node.
+
+Each node's config is independent (no shared filesystem) — repeat on **all** nodes, one at a time (the keepalived VIP fails over to the others during each restart).
+
+> **Status (2026-07-08): applied on nodes 2 and 3 only.** Node 1 (`10.99.97.51`) still needs this same change — it was unreachable during an ongoing genset maintenance window. Until node 1 is updated, a VIP failover to node 1 will make this script fail even though it works from nodes 2/3. Confirm which node currently holds the VIP (`monitor.py`, or `ip a` / keepalived logs on a node) before assuming the API is available.
+
+### Usage
+
+Start from the template, fill in the `Requests` tab (see its `Instructions` tab for column meanings), then run:
+
+```bash
+python3 create_private_resources.py pangolin_private_resources_template.xlsx --dry-run
+python3 create_private_resources.py my_requests.xlsx
+python3 create_private_resources.py my_requests.xlsx --config /path/to/config.yml
+```
+
+Requests sheet columns: `Name | Destination (IP or CIDR) | Alias | TCP Ports | UDP Ports | ICMP | User Emails | Notes`
+
+- **TCP/UDP Ports**: `all` → every port, `blocked` (or empty) → protocol fully blocked, or a custom list (`80,443` / `8000-9000,443`).
+- **Destination**: a single IP is created as a `host` resource; a CIDR (e.g. `10.23.30.0/24`) as a `network` resource.
+- **Alias**: optional FQDN (e.g. `app.internal`) to reach the resource by name instead of IP. Doesn't apply to CIDR rows; leave blank otherwise.
+- **User Emails**: comma-separated university emails, resolved against the org's user list. Access is granted **only** to these users (`roleIds` is always empty — no role-based access). Unresolved emails are reported as warnings, never silently dropped.
+
+Every run writes a `<input>_results_<timestamp>.xlsx` report next to the input file with a `Status` per site-resource (OK / FAIL / DRY-RUN), the created `siteResourceId`/`niceId`, the `Sites` it spans, and any unresolved emails or API errors.
+
+Filled-in request and report `.xlsx` files are git-ignored (only `*template.xlsx` is tracked) since they carry real internal IPs and emails.
+
+> **Not yet supported:** updating an existing site resource (e.g. by its `niceId` from a previous Results sheet). Only creation is implemented today — see the `TODO` above `main()` in `create_private_resources.py`.
 
 ---
 

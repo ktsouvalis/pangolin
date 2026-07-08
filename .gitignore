@@ -5,3 +5,5 @@ config.yml
 *.log
 venv/
 *.csv
+*.xlsx
+!*template.xlsx
