@@ -260,7 +260,7 @@ Requests sheet columns: `Name | Operation System | Destination (IP or CIDR) | Al
 - **Alias**: optional FQDN (e.g. `app.internal`) to reach the resource by name instead of IP. Doesn't apply to CIDR rows; leave blank otherwise.
 - **User Emails**: comma-separated university emails, resolved against the org's user list. Access is granted **only** to these users (`roleIds` is always empty — no role-based access). Unresolved emails are reported as warnings, never silently dropped.
 
-Every run writes a `<input>_results_<timestamp>.xlsx` report next to the input file: the request contents (Name, Destination, Alias, OS, User Emails, Notes) plus `Sites` it spans, `Status` per site-resource (OK / FAIL / DRY-RUN), the created `niceId`, a `Timestamp` of the creation/attempt, and any unresolved emails or errors.
+Every run writes a `<input>_results_<timestamp>.xlsx` report next to the input file: the request contents (Name, Destination, Alias, **TCP Ports** — the resolved port string for that row's OS, not the OS itself — User Emails, Notes) plus `Sites` it spans, `Status` per site-resource (OK / FAIL / DRY-RUN), the created `niceId`, a `Timestamp` of the creation/attempt, and any unresolved emails or errors.
 
 Filled-in request and report `.xlsx` files are git-ignored (only `*template.xlsx` is tracked) since they carry real internal IPs and emails.
 

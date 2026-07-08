@@ -164,7 +164,7 @@ def create_site_resource(cfg, sites, req, dry_run):
         "name": req["name"],
         "destination": req["destination"],
         "alias": req.get("alias"),
-        "os": req["os"],
+        "tcp_ports": req["tcpPortRangeString"] or None,
         "emails": req["_raw_emails"],
         "notes": req["_notes"],
         "sites": site_names,
@@ -211,7 +211,7 @@ def write_report(input_path, results):
         del wb["Results"]
     ws = wb.create_sheet("Results")
 
-    headers = ["Row", "Name", "Destination", "Alias", "OS", "User Emails", "Notes", "Sites",
+    headers = ["Row", "Name", "Destination", "Alias", "TCP Ports", "User Emails", "Notes", "Sites",
                "Status", "Nice ID", "Timestamp", "Unresolved Emails", "Error"]
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
@@ -230,7 +230,7 @@ def write_report(input_path, results):
 
     for r, res in enumerate(results, start=2):
         values = [
-            res["row_num"], res["name"], res["destination"], res["alias"], res["os"],
+            res["row_num"], res["name"], res["destination"], res["alias"], res["tcp_ports"],
             res["emails"], res["notes"], res["sites"],
             res["status"], res["nice_id"], res["timestamp"],
             res["unresolved_emails"], res["error"],
@@ -241,7 +241,7 @@ def write_report(input_path, results):
         if fill_color:
             ws.cell(row=r, column=9).fill = PatternFill("solid", fgColor=fill_color)
 
-    widths = [6, 22, 22, 22, 10, 26, 30, 30, 10, 26, 18, 30, 40]
+    widths = [6, 22, 22, 22, 14, 26, 30, 30, 10, 26, 18, 30, 40]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
 
