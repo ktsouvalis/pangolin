@@ -183,7 +183,8 @@ def create_site_resource(cfg, sites, req, dry_run):
         return result
 
     if dry_run:
-        print(f"  [DRY-RUN] {payload}")
+        printable = {k: v for k, v in payload.items() if k not in ("roleIds", "clientIds")}
+        print(f"  [DRY-RUN] {printable}")
         result["status"] = "DRY-RUN"
         return result
 
