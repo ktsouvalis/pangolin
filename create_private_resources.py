@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Create Pangolin private (site) resources from a filled-in xlsx request sheet.
-Each row becomes a single site resource spanning every site in the org (via
-the API's siteIds array), so it's reachable through any site's tunnel for HA.
-Writes a results report alongside the input file.
+Each User Emails entry on a row becomes its OWN site resource (so a row with 3
+emails creates 3 resources), each spanning every site in the org (via the
+API's siteIds array) for HA. Writes a results report alongside the input file.
 
 Config (config.yml, key-value, nested under 'pangolin'):
     pangolin:
@@ -13,6 +13,9 @@ Config (config.yml, key-value, nested under 'pangolin'):
 
 Requests sheet columns (see pangolin_private_resources_template.xlsx):
     Name | Destination (IP or CIDR) | Alias | OS | User Emails | Notes
+
+Name: the city (filled in by the Digital Governance Unit, not the requester),
+      used as the first segment of the computed resource name.
 
 Alias: optional FQDN (e.g. "app.internal") to reach the resource by name instead
        of IP. Not applicable when Destination is a CIDR range; left blank most
@@ -24,8 +27,14 @@ OS drives a fixed TCP port policy (UDP and ICMP are always blocked):
 Any other/blank value fails that row locally (no API call) rather than
 guessing a port policy.
 
-User Emails: comma-separated; each resolved to a user ID (unresolved emails are
-             reported as warnings and never silently dropped from the report).
+User Emails: comma-separated. Each email becomes a separate site resource,
+             named "<city>-<username>-<vlan>[-<z>]" where username is the part
+             of the email before "@", and vlan/z come from Destination's
+             10.x.y.z octets (y zero-padded to 2 digits, z not padded; z is
+             dropped for CIDR destinations). E.g. ktsouvalis@uop.gr at
+             10.23.2.50 with city "patra" -> patra-ktsouvalis-2302-50.
+             Unresolved emails are skipped (no resource created) and reported
+             as a FAIL row, never silently dropped from the report.
 
 Usage:
     python3 create_private_resources.py requests.xlsx --dry-run
@@ -111,47 +120,97 @@ OS_TCP_PORTS = {
 }
 
 
+def compute_vlan_z(destination, mode):
+    """Derive the vlan/z name segments from a 10.x.y.z destination.
+
+    vlan = x concatenated with y zero-padded to 2 digits (e.g. 10.23.2.50 ->
+    "2302"); z is the 4th octet, not padded, and omitted entirely for CIDR
+    destinations (no single host octet to point at).
+    """
+    ip_part = destination.split("/", 1)[0].strip()
+    parts = ip_part.split(".")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        return None, None
+    x, y, z = parts[1], parts[2], parts[3]
+    vlan = f"{int(x)}{int(y):02d}"
+    z_val = None if mode == "cidr" else str(int(z))
+    return vlan, z_val
+
+
 def parse_row(row_num, row, user_index):
-    name, os_value, destination, alias, emails, notes = row
+    """Return (resolved_reqs, fail_results) for a row.
+
+    Each User Emails entry becomes its own resource request; anything that
+    can't produce one (missing emails, bad OS, unparseable destination,
+    unresolved email) becomes a FAIL result instead, without calling the API.
+    """
+    city, os_value, destination, alias, emails, notes = row
     if not destination:
-        return None
+        return [], []
 
     destination = str(destination).strip()
     mode = "cidr" if "/" in destination else "host"
     alias = str(alias).strip() if alias else None
     os_display = str(os_value).strip() if os_value else ""
     tcp_ports = OS_TCP_PORTS.get(os_display.lower())
+    city = str(city).strip() if city else ""
+    notes_val = str(notes).strip() if notes else None
+    vlan, z_val = compute_vlan_z(destination, mode)
 
-    resolved_users, unresolved = [], []
-    for raw_email in str(emails or "").split(","):
-        email = raw_email.strip().lower()
-        if not email:
+    raw_emails = [e.strip() for e in str(emails or "").split(",") if e.strip()]
+
+    def make_fail(email, error):
+        return {
+            "row_num": row_num, "city": city, "name": None, "destination": destination,
+            "alias": alias, "tcp_ports": tcp_ports, "email": email, "notes": notes_val,
+            "sites": None, "status": "FAIL", "nice_id": None,
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "error": error,
+        }
+
+    if not raw_emails:
+        return [], [make_fail(None, "no User Emails provided")]
+
+    resolved_reqs, fail_results = [], []
+    for raw_email in raw_emails:
+        email = raw_email.lower()
+        if tcp_ports is None:
+            fail_results.append(make_fail(raw_email,
+                f"invalid/missing OS {os_display!r} (expected 'Linux' or 'Windows')"))
             continue
-        if email in user_index:
-            resolved_users.append(user_index[email])
-        else:
-            unresolved.append(email)
+        if vlan is None:
+            fail_results.append(make_fail(raw_email,
+                f"destination {destination!r} is not a valid IPv4 host/CIDR"))
+            continue
+        if email not in user_index:
+            fail_results.append(make_fail(raw_email, f"unresolved email: {raw_email}"))
+            continue
 
-    req = {
-        "_row_num": row_num,
-        "name": (str(name).strip() if name else destination),
-        "mode": mode,
-        "destination": destination,
-        "os": os_display,
-        "tcpPortRangeString": tcp_ports or "",
-        "udpPortRangeString": "",
-        "disableIcmp": True,
-        "roleIds": [],
-        "clientIds": [],
-        "userIds": resolved_users,
-        "_unresolved_emails": unresolved,
-        "_notes": str(notes).strip() if notes else None,
-        "_raw_emails": str(emails).strip() if emails else None,
-        "_os_error": tcp_ports is None,
-    }
-    if alias:
-        req["alias"] = alias
-    return req
+        username = email.split("@", 1)[0]
+        name_parts = [city.lower(), username, vlan] + ([z_val] if z_val is not None else [])
+        resource_name = "-".join(p for p in name_parts if p)
+
+        req = {
+            "_row_num": row_num,
+            "_city": city,
+            "_notes": notes_val,
+            "_email": raw_email,
+            "name": resource_name,
+            "mode": mode,
+            "destination": destination,
+            "os": os_display,
+            "tcpPortRangeString": tcp_ports,
+            "udpPortRangeString": "",
+            "disableIcmp": True,
+            "roleIds": [],
+            "clientIds": [],
+            "userIds": [user_index[email]],
+        }
+        if alias:
+            req["alias"] = alias
+        resolved_reqs.append(req)
+
+    return resolved_reqs, fail_results
 
 
 def create_site_resource(cfg, sites, req, dry_run):
@@ -161,26 +220,19 @@ def create_site_resource(cfg, sites, req, dry_run):
 
     result = {
         "row_num": req["_row_num"],
+        "city": req["_city"],
         "name": req["name"],
         "destination": req["destination"],
         "alias": req.get("alias"),
         "tcp_ports": req["tcpPortRangeString"] or None,
-        "emails": req["_raw_emails"],
+        "email": req["_email"],
         "notes": req["_notes"],
         "sites": site_names,
         "status": None,
         "nice_id": None,
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "error": None,
-        "unresolved_emails": ", ".join(req["_unresolved_emails"]) or None,
     }
-
-    if req["_os_error"]:
-        msg = f"invalid/missing OS {req['os']!r} (expected 'Linux' or 'Windows')"
-        print(f"  [FAIL] {msg}")
-        result["status"] = "FAIL"
-        result["error"] = msg
-        return result
 
     if dry_run:
         printable = {k: v for k, v in payload.items() if k not in ("roleIds", "clientIds")}
@@ -211,8 +263,8 @@ def write_report(input_path, results):
         del wb["Results"]
     ws = wb.create_sheet("Results")
 
-    headers = ["Row", "Name", "Destination", "Alias", "TCP Ports", "User Emails", "Notes", "Sites",
-               "Status", "Nice ID", "Timestamp", "Unresolved Emails", "Error"]
+    headers = ["Row", "City", "Name", "Destination", "Alias", "TCP Ports", "Email", "Notes", "Sites",
+               "Status", "Nice ID", "Timestamp", "Error"]
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
 
@@ -230,18 +282,17 @@ def write_report(input_path, results):
 
     for r, res in enumerate(results, start=2):
         values = [
-            res["row_num"], res["name"], res["destination"], res["alias"], res["tcp_ports"],
-            res["emails"], res["notes"], res["sites"],
-            res["status"], res["nice_id"], res["timestamp"],
-            res["unresolved_emails"], res["error"],
+            res["row_num"], res["city"], res["name"], res["destination"], res["alias"],
+            res["tcp_ports"], res["email"], res["notes"], res["sites"],
+            res["status"], res["nice_id"], res["timestamp"], res["error"],
         ]
         for c, v in enumerate(values, start=1):
             ws.cell(row=r, column=c, value=v)
         fill_color = status_colors.get(res["status"])
         if fill_color:
-            ws.cell(row=r, column=9).fill = PatternFill("solid", fgColor=fill_color)
+            ws.cell(row=r, column=10).fill = PatternFill("solid", fgColor=fill_color)
 
-    widths = [6, 22, 22, 22, 14, 26, 30, 30, 10, 26, 18, 30, 40]
+    widths = [6, 14, 24, 22, 22, 14, 26, 30, 30, 10, 26, 18, 40]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
 
@@ -277,36 +328,37 @@ def main():
     ws = wb[args.sheet]
     raw_rows = list(ws.iter_rows(min_row=2, max_col=6, values_only=True))
 
-    requests_parsed = []
+    requests_parsed, upfront_fails = [], []
     for i, row in enumerate(raw_rows, start=2):
-        parsed = parse_row(i, row, user_index)
-        if parsed:
-            requests_parsed.append(parsed)
+        resolved, fails = parse_row(i, row, user_index)
+        requests_parsed.extend(resolved)
+        upfront_fails.extend(fails)
 
-    print(f"\nParsed {len(requests_parsed)} request row(s) from '{args.xlsx_path}'")
-    print(f"Creating {len(requests_parsed)} site-resource(s), each spanning all "
-          f"{len(sites)} site(s)\n")
+    print(f"\nParsed {len(raw_rows)} row(s) from '{args.xlsx_path}': "
+          f"{len(requests_parsed)} resource(s) to create "
+          f"(one per resolved User Emails entry), {len(upfront_fails)} skipped\n")
 
     all_results = []
     for req in requests_parsed:
         print(f"- row {req['_row_num']}: {req['name']} ({req['mode']}: {req['destination']}) "
+              f"email={req['_email']} "
               f"alias={req.get('alias') or '-'} "
               f"os={req['os'] or '-'} "
               f"tcp={req['tcpPortRangeString'] or 'blocked'} "
               f"udp=blocked icmp=blocked")
-        if req["_unresolved_emails"]:
-            print(f"  [WARN] unresolved email(s): {req['_unresolved_emails']}")
         all_results.append(create_site_resource(cfg, sites, req, args.dry_run))
+
+    for fail in upfront_fails:
+        print(f"  [FAIL] row {fail['row_num']}: {fail['error']}")
+    all_results.extend(upfront_fails)
+    all_results.sort(key=lambda r: r["row_num"])
 
     out_path = write_report(args.xlsx_path, all_results)
     print(f"\nReport written to: {out_path}")
 
     fails = [r for r in all_results if r["status"] == "FAIL"]
-    warns = [r for r in all_results if r["unresolved_emails"]]
     if fails:
-        print(f"WARNING: {len(fails)} creation(s) failed — see report.")
-    if warns:
-        print(f"WARNING: {len(warns)} row(s) had unresolved email(s) — see report.")
+        print(f"WARNING: {len(fails)} row(s)/email(s) failed or were skipped — see report.")
 
 
 if __name__ == "__main__":

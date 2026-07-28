@@ -6,7 +6,7 @@ A set of tools for the **Pangolin HA Cluster**:
 |---|---|
 | `monitor.py` | Real-time TUI dashboard — polls every 20 s, one panel per service |
 | `logs_viewer.py` | TUI log viewer — fetches warnings/errors from all nodes via SSH |
-| `create_private_resources.py` | CLI — batch-creates private (site) resources from a filled-in xlsx request sheet; each row becomes one resource spanning every site for HA |
+| `create_private_resources.py` | CLI — batch-creates private (site) resources from a filled-in xlsx request sheet; each User Emails entry becomes one resource spanning every site for HA |
 
 Built with [Textual](https://textual.textualize.io/). No agents, no daemons — runs from any workstation that can reach the cluster network.
 
@@ -201,7 +201,7 @@ services:
 
 ## Private resource creation (create_private_resources.py)
 
-Batch-creates Pangolin private (site) resources from a filled-in xlsx request sheet. Each row becomes **one** site resource spanning **every site in the org** (via the API's `siteIds` array), so it's reachable through any site's tunnel for HA. Not a TUI — plain CLI, prints progress to stdout.
+Batch-creates Pangolin private (site) resources from a filled-in xlsx request sheet. Each **User Emails** entry on a row becomes its **own** site resource (a row with 3 emails creates 3 resources), each spanning **every site in the org** (via the API's `siteIds` array), so it's reachable through any site's tunnel for HA. Not a TUI — plain CLI, prints progress to stdout.
 
 ### One-time server-side setup: enabling the Integration API
 
@@ -252,15 +252,18 @@ python3 create_private_resources.py my_requests.xlsx --config /path/to/config.ym
 
 Requests sheet columns: `Name | Operation System | Destination (IP or CIDR) | Alias | User Emails | Notes`
 
+- **Name**: the city, filled in by the Digital Governance Unit (not the requester) — it's the first segment of the computed resource name (see below), not a free-form label.
 - **Operation System**: `Linux` or `Windows`. Drives a fixed TCP port policy — UDP and ICMP are always blocked, not user-configurable:
   - `Linux` → TCP `22,3389`
   - `Windows` → TCP `23579`
   - Any other/blank value fails that row locally (no API call) rather than guessing a port policy.
 - **Destination**: a single IP is created as a `host` resource; a CIDR (e.g. `10.23.30.0/24`) as a `network` resource.
 - **Alias**: optional FQDN (e.g. `app.internal`) to reach the resource by name instead of IP. Doesn't apply to CIDR rows; leave blank otherwise.
-- **User Emails**: comma-separated university emails, resolved against the org's user list. Access is granted **only** to these users (`roleIds` is always empty — no role-based access). Unresolved emails are reported as warnings, never silently dropped.
+- **User Emails**: comma-separated university emails. **Each email becomes its own site resource** — a row with 3 emails creates 3 resources, each granting access to only that one resolved user (`roleIds` is always empty — no role-based access). An unresolved email is skipped (no resource created for it, reported as a FAIL row); the row's other emails still get their resources created.
 
-Every run writes a `<input>_results_<timestamp>.xlsx` report next to the input file: the request contents (Name, Destination, Alias, **TCP Ports** — the resolved port string for that row's OS, not the OS itself — User Emails, Notes) plus `Sites` it spans, `Status` per site-resource (OK / FAIL / DRY-RUN), the created `niceId`, a `Timestamp` of the creation/attempt, and any unresolved emails or errors.
+Resource names are computed, not typed in: `<city>-<username>-<vlan>[-<z>]`, where `city` is the (lowercased) `Name` column, `username` is the part of the email before `@`, and `vlan`/`z` come from the Destination's `10.x.y.z` octets — `y` zero-padded to 2 digits, `z` left unpadded, and `z` dropped entirely for CIDR destinations. Example: `ktsouvalis@uop.gr` at `10.23.2.50`, city "Patra" → `patra-ktsouvalis-2302-50`.
+
+Every run writes a `<input>_results_<timestamp>.xlsx` report next to the input file, one row per attempted resource (or per skipped email): `City`, computed `Name`, `Destination`, `Alias`, **TCP Ports** — the resolved port string for that row's OS, not the OS itself — `Email`, `Notes`, `Sites` it spans, `Status` (OK / FAIL / DRY-RUN), the created `niceId`, a `Timestamp` of the attempt, and any `Error` (including unresolved emails or a row with no emails at all).
 
 Filled-in request and report `.xlsx` files are git-ignored (only `*template.xlsx` is tracked) since they carry real internal IPs and emails.
 
