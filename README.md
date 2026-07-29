@@ -7,6 +7,7 @@ A set of tools for the **Pangolin HA Cluster**:
 | `monitor.py` | Real-time TUI dashboard — polls every 20 s, one panel per service |
 | `logs_viewer.py` | TUI log viewer — fetches warnings/errors from all nodes via SSH |
 | `create_private_resources.py` | CLI — batch-creates private (site) resources from a filled-in xlsx request sheet; each User Emails entry becomes one resource spanning every site for HA |
+| `normalize_private_resources.py` | CLI — audits existing private resources against that naming convention and fixes drift; backfills access for resources created without a matching user |
 
 Built with [Textual](https://textual.textualize.io/). No agents, no daemons — runs from any workstation that can reach the cluster network.
 
@@ -257,11 +258,11 @@ Requests sheet columns: `Name | Operation System | Destination (IP or CIDR) | Po
 - **Destination**: a single IP is created as a `host` resource; a CIDR (e.g. `10.23.30.0/24`) as a `network` resource.
 - **Ports**: comma-separated TCP port numbers (e.g. `22,3389`), user-entered per row. UDP and ICMP are always blocked, not user-configurable. A blank value or any non-numeric token fails that row locally (no API call) rather than guessing a port policy.
 - **Alias**: optional FQDN (e.g. `app.internal`) to reach the resource by name instead of IP. Doesn't apply to CIDR rows; leave blank otherwise.
-- **User Emails**: comma-separated university emails. **Each email becomes its own site resource** — a row with 3 emails creates 3 resources, each granting access to only that one resolved user (`roleIds` is always empty — no role-based access). An unresolved email is skipped (no resource created for it, reported as a FAIL row); the row's other emails still get their resources created.
+- **User Emails**: comma-separated university emails. **Each email becomes its own site resource** — a row with 3 emails creates 3 resources, each granting access to only that one resolved user (`roleIds` is always empty — no role-based access). An email that doesn't match any current org user still gets its resource created (the name never depended on the lookup succeeding) but with no user attached — reported as `OK_NO_USER`/`DRY-RUN_NO_USER` rather than skipped. Run `normalize_private_resources.py` later, once the account exists, to backfill access. A row is only skipped locally (no API call, reported `FAIL`) for invalid `Ports` or an unparseable `Destination`, or if it has no emails at all.
 
 Resource names are computed, not typed in: `<city>-<username>-<vlan>[-<z>]`, where `city` is the (lowercased) `Name` column, `username` is the part of the email before `@` with any `.` stripped (e.g. `m.katsis` → `mkatsis`), and `vlan`/`z` come from the Destination's `10.x.y.z` octets — `y` zero-padded to 2 digits, `z` left unpadded, and `z` dropped entirely for CIDR destinations. Example: `ktsouvalis@uop.gr` at `10.23.2.50`, city "Patra" → `patra-ktsouvalis-2302-50`.
 
-Every run writes a `<input>_results_<timestamp>.xlsx` report next to the input file, one row per attempted resource (or per skipped email): `City`, computed `Name`, `Destination`, `Alias`, **TCP Ports** — the row's `Ports` value as parsed — `Email`, `Notes`, `Sites` it spans, `Status` (OK / FAIL / DRY-RUN), the created `niceId`, a `Timestamp` of the attempt, and any `Error` (including unresolved emails or a row with no emails at all).
+Every run writes a `<input>_results_<timestamp>.xlsx` report next to the input file, one row per attempted resource (or per skipped email): `City`, computed `Name`, `Destination`, `Alias`, **TCP Ports** — the row's `Ports` value as parsed — `Email`, `Notes`, `Sites` it spans, `Status` (`OK` / `OK_NO_USER` / `FAIL` / `DRY-RUN` / `DRY-RUN_NO_USER`), the created `niceId`, a `Timestamp` of the attempt, and any `Error` (including the no-user-match note or a row with no emails at all).
 
 Filled-in request and report `.xlsx` files are git-ignored (only `*template.xlsx` is tracked) since they carry real internal IPs and emails.
 
@@ -280,9 +281,9 @@ Audits *existing* Pangolin private resources — fetched live via the Integratio
 
 - exactly 1 user assigned → that user, unconditionally.
 - 2+ users assigned → resolved only if exactly one of them has a sanitized email matching a segment of the existing name (i.e. the name already seems to identify a primary owner among several grantees); otherwise skipped as ambiguous.
-- 0 users assigned → skipped; the report includes a best-effort suggested email if exactly one org user's sanitized local part matches a name segment, for a human to confirm and grant by hand.
+- 0 users assigned → this is the expected state for a resource `create_private_resources.py` created for an email that didn't match any org user yet (its `OK_NO_USER` status). Auto-resolved and granted (`action=grant_access`, no confirmation needed) **only** when the name is an *exact* reconstruction of the naming convention: peeling the known city and known vlan/tail (from the destination) off the name leaves exactly one org user's sanitized local part — the literal reverse of `create_private_resources.py`'s own naming formula, not a guess. Anything looser (name isn't an exact match, or the leftover matches zero/multiple org users) is skipped instead, with a best-effort suggested email for a human to confirm and grant by hand.
 
-It never grants access to someone who doesn't already have it — a 0-user or genuinely ambiguous resource is always reported and left alone, never guessed.
+It never grants access on a loose guess — only the exact-reconstruction case above is auto-applied; a genuinely ambiguous or non-conforming resource is always reported and left alone.
 
 ```bash
 python3 normalize_private_resources.py                                    # dry run, full report

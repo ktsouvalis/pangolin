@@ -34,8 +34,14 @@ User Emails: comma-separated. Each email becomes a separate site resource,
              (y zero-padded to 2 digits, z not padded; z is dropped for CIDR
              destinations). E.g. ktsouvalis@uop.gr at 10.23.2.50 with city
              "patra" -> patra-ktsouvalis-2302-50.
-             Unresolved emails are skipped (no resource created) and reported
-             as a FAIL row, never silently dropped from the report.
+             An email that doesn't match any current Pangolin user still gets
+             its resource created (name computed the same way, since the name
+             never depended on the user lookup) but with no user attached
+             (userIds: []); reported as OK_NO_USER / DRY-RUN_NO_USER rather
+             than silently dropped or failed. Run normalize_private_resources.py
+             later, once the account exists, to backfill access -- it looks
+             for exactly this pattern (correctly-named resource, 0 users) and
+             reverses the naming formula to find the matching org user.
 
 Usage:
     python3 create_private_resources.py requests.xlsx --dry-run
@@ -188,19 +194,18 @@ def parse_row(row_num, row, user_index):
             fail_results.append(make_fail(raw_email,
                 f"destination {destination!r} is not a valid IPv4 host/CIDR"))
             continue
-        if email not in user_index:
-            fail_results.append(make_fail(raw_email, f"unresolved email: {raw_email}"))
-            continue
 
         username = email.split("@", 1)[0].replace(".", "")
         name_parts = [city.lower(), username, vlan] + ([z_val] if z_val is not None else [])
         resource_name = "-".join(p for p in name_parts if p)
 
+        user_id = user_index.get(email)
         req = {
             "_row_num": row_num,
             "_city": city,
             "_notes": notes_val,
             "_email": raw_email,
+            "_user_resolved": user_id is not None,
             "name": resource_name,
             "mode": mode,
             "destination": destination,
@@ -210,7 +215,7 @@ def parse_row(row_num, row, user_index):
             "disableIcmp": True,
             "roleIds": [],
             "clientIds": [],
-            "userIds": [user_index[email]],
+            "userIds": [user_id] if user_id is not None else [],
         }
         if alias:
             req["alias"] = alias
@@ -223,6 +228,7 @@ def create_site_resource(cfg, sites, req, dry_run):
     payload = {k: v for k, v in req.items() if not k.startswith("_") and k != "os"}
     payload["siteIds"] = [s["siteId"] for s in sites]
     site_names = ", ".join(s["name"] for s in sites)
+    no_user = not req["_user_resolved"]
 
     result = {
         "row_num": req["_row_num"],
@@ -237,13 +243,15 @@ def create_site_resource(cfg, sites, req, dry_run):
         "status": None,
         "nice_id": None,
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "error": None,
+        "error": (f"no user match: {req['_email']!r} not found among org users -- "
+                  f"resource created without access, backfill later via "
+                  f"normalize_private_resources.py") if no_user else None,
     }
 
     if dry_run:
         printable = {k: v for k, v in payload.items() if k not in ("roleIds", "clientIds")}
         print(f"  [DRY-RUN] {printable}")
-        result["status"] = "DRY-RUN"
+        result["status"] = "DRY-RUN_NO_USER" if no_user else "DRY-RUN"
         return result
 
     resp = session.put(f"{cfg['base_url']}/v1/org/{cfg['org_slug']}/site-resource",
@@ -256,10 +264,10 @@ def create_site_resource(cfg, sites, req, dry_run):
         return result
 
     body = resp.json()["data"]
-    result["status"] = "OK"
+    result["status"] = "OK_NO_USER" if no_user else "OK"
     result["nice_id"] = body["niceId"]
-    print(f"  [OK] siteResourceId={body['siteResourceId']} niceId={body['niceId']} "
-          f"sites=[{site_names}]")
+    print(f"  [{'OK-NO-USER' if no_user else 'OK'}] siteResourceId={body['siteResourceId']} "
+          f"niceId={body['niceId']} sites=[{site_names}]")
     return result
 
 
@@ -284,6 +292,8 @@ def write_report(input_path, results):
         "OK": "C6EFCE",
         "FAIL": "FFC7CE",
         "DRY-RUN": "FFEB9C",
+        "OK_NO_USER": "FCE4D6",
+        "DRY-RUN_NO_USER": "FFF2CC",
     }
 
     for r, res in enumerate(results, start=2):
@@ -365,6 +375,12 @@ def main():
     fails = [r for r in all_results if r["status"] == "FAIL"]
     if fails:
         print(f"WARNING: {len(fails)} row(s)/email(s) failed or were skipped — see report.")
+
+    no_user = [r for r in all_results if r["status"] in ("OK_NO_USER", "DRY-RUN_NO_USER")]
+    if no_user:
+        print(f"NOTE: {len(no_user)} resource(s) created without a matching user — "
+              f"see report; run normalize_private_resources.py later once those "
+              f"accounts exist.")
 
 
 if __name__ == "__main__":

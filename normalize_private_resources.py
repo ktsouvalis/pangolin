@@ -32,11 +32,21 @@ For each in-scope resource:
         sanitized local part matches a "-"-separated segment of the
         existing name (i.e. the name already appears to identify a primary
         owner among several grantees). Otherwise AMBIGUOUS, skipped.
-      * 0 users assigned -> UNRESOLVED, skipped. Never grants access to
-        someone who doesn't already have it; the report includes a
-        best-effort suggested email if exactly one org user's sanitized
-        local part matches a name segment, for a human to confirm and
-        apply by hand.
+      * 0 users assigned -> this is the expected state for a resource that
+        create_private_resources.py created for an email that didn't match
+        any org user yet (reported there as OK_NO_USER). Auto-resolved (no
+        confirmation needed) ONLY when the name is already an *exact* match
+        for the naming convention: peel the known city (name's first
+        segment) and the known vlan/tail (computed from the destination,
+        same as always) off the name, and if what's left is exactly one
+        org user's sanitized local part, that's not a guess -- it's the
+        literal reverse of create_private_resources.py's own naming
+        formula. Access is granted (action=grant_access), no rename needed
+        by construction. Anything looser (name doesn't exactly reconstruct,
+        or the leftover matches zero or multiple org users) stays
+        UNRESOLVED/skipped as before, with a best-effort suggested email
+        (looser: any name segment matching a sanitized local part) for a
+        human to confirm and apply by hand -- never auto-granted.
   - rename: POST /site-resource/{id} {"name": ...} if the computed name
     differs from the current one.
   - access: POST /site-resource/{id}/users {"userIds": [target]} if the
@@ -125,15 +135,17 @@ def get_site_resources(cfg):
 
 
 def build_org_email_index(cfg):
-    """sanitized local-part -> [emails] across every org user, for best-effort
-    suggestions on resources with no resolvable currently-assigned user."""
+    """sanitized local-part -> [(email, userId)] across every org user, used
+    both for the strict 0-user auto-resolve and for best-effort suggestions
+    on resources with no resolvable currently-assigned user."""
     users = get_all_pages(cfg, f"/org/{cfg['org_slug']}/users", "users")
     index = {}
     for u in users:
         email = (u.get("email") or u.get("user", {}).get("email") or "").lower()
-        if not email:
+        uid = u.get("id") or u.get("user", {}).get("id")
+        if not email or not uid:
             continue
-        index.setdefault(sanitize_username(email), []).append(email)
+        index.setdefault(sanitize_username(email), []).append((email, uid))
     return index
 
 
@@ -221,6 +233,31 @@ def compute_naming_segments(destination, mode):
     return None, None
 
 
+def resolve_unassigned_target(name, city, vlan, tail, org_email_index):
+    """Strict reverse of create_private_resources.py's naming formula, for a
+    resource with 0 users currently assigned. Peels the known city and known
+    vlan/tail (both already independently derived -- city from the name's
+    own first segment, vlan/tail from the destination) off the name; if
+    what's left is exactly one org user's sanitized local part, that's not a
+    guess, so it's safe to auto-grant. Returns (email, userId) or
+    (None, None) if the name isn't an exact convention match or the leftover
+    doesn't uniquely resolve.
+    """
+    if not name:
+        return None, None
+    lname = name.lower()
+    prefix, suffix = f"{city}-", f"-{vlan}-{tail}"
+    if not (lname.startswith(prefix) and lname.endswith(suffix)):
+        return None, None
+    candidate_username = lname[len(prefix):-len(suffix)]
+    if not candidate_username or "-" in candidate_username:
+        return None, None
+    candidates = org_email_index.get(candidate_username, [])
+    if len(candidates) != 1:
+        return None, None
+    return candidates[0]
+
+
 def resolve_target(name, users, org_email_index):
     """Return (target_email, target_user_id, reason_if_unresolved, suggested_email).
 
@@ -232,7 +269,8 @@ def resolve_target(name, users, org_email_index):
     resolved = [(u.get("email"), u.get("userId")) for u in users if u.get("email")]
 
     if len(users) == 0:
-        candidates = sorted({e for seg in name_segments for e in org_email_index.get(seg, [])})
+        candidates = sorted({e for seg in name_segments
+                              for e, _ in org_email_index.get(seg, [])})
         suggestion = candidates[0] if len(candidates) == 1 else None
         return None, None, "no users currently assigned", suggestion
 
@@ -295,8 +333,18 @@ def process_resource(cfg, res, org_email_index, apply_changes):
         anomaly = (f"unexpected roles/clients (roles={role_names}, clients={len(clients)}) "
                    f"-- not modified, review manually")
 
-    target_email, target_user_id, unresolved_reason, suggestion = resolve_target(
-        res["name"], users, org_email_index)
+    if len(users) == 0:
+        strict_email, strict_user_id = resolve_unassigned_target(
+            res["name"], city, vlan, tail, org_email_index)
+    else:
+        strict_email, strict_user_id = None, None
+
+    if strict_email:
+        target_email, target_user_id, unresolved_reason, suggestion = (
+            strict_email, strict_user_id, None, None)
+    else:
+        target_email, target_user_id, unresolved_reason, suggestion = resolve_target(
+            res["name"], users, org_email_index)
 
     if unresolved_reason:
         row["status"] = "SKIPPED"
@@ -328,7 +376,7 @@ def process_resource(cfg, res, org_email_index, apply_changes):
     if needs_rename:
         actions.append("rename")
     if needs_access_fix:
-        actions.append("prune_access")
+        actions.append("grant_access" if len(users) == 0 else "prune_access")
     row["action"] = "+".join(actions)
 
     if not apply_changes:
