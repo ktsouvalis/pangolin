@@ -269,6 +269,33 @@ Filled-in request and report `.xlsx` files are git-ignored (only `*template.xlsx
 
 ---
 
+## Private resource normalization (normalize_private_resources.py)
+
+Audits *existing* Pangolin private resources — fetched live via the Integration API, not from a spreadsheet — against the naming convention above, and fixes the ones that drift from it. Unlike `create_private_resources.py`, it covers both `host` and `cidr` resources:
+
+- **host**: `<city>-<username>-<vlan>-<z>`, same as resource creation.
+- **cidr**: `<city>-<username>-<vlan>-<tail>`, where `vlan` is built from however many octets the subnet mask actually fixes (dropped below `/16`), and `tail` is `all` for the common `/24` case or the literal prefix length otherwise (e.g. `/16` → `16`), so an unusual mask is never mistaken for a `/24`.
+
+`city` is taken from the resource's *existing* name (its first `-`-separated segment) since the API has no separate city field. The target user (whose sanitized email local part becomes the username segment, and who ends up as the resource's *only* grantee) is resolved from who currently has access:
+
+- exactly 1 user assigned → that user, unconditionally.
+- 2+ users assigned → resolved only if exactly one of them has a sanitized email matching a segment of the existing name (i.e. the name already seems to identify a primary owner among several grantees); otherwise skipped as ambiguous.
+- 0 users assigned → skipped; the report includes a best-effort suggested email if exactly one org user's sanitized local part matches a name segment, for a human to confirm and grant by hand.
+
+It never grants access to someone who doesn't already have it — a 0-user or genuinely ambiguous resource is always reported and left alone, never guessed.
+
+```bash
+python3 normalize_private_resources.py                                    # dry run, full report
+python3 normalize_private_resources.py --apply                            # apply for real (confirms first)
+python3 normalize_private_resources.py --apply --resource-id 130 --yes    # apply to one resource, no prompt
+```
+
+Defaults to a dry run — no changes are made unless `--apply` is passed, and a full unscoped `--apply` asks for interactive confirmation first (skip it with `--yes`, or scope to specific resources with one or more `--resource-id`). Every run writes a `private_resources_normalize_<timestamp>.xlsx` report (git-ignored, same as the request/report files above) listing every resource considered, what would change (or did), and why anything was skipped.
+
+Roles and clients granted on a resource are read and reported but never modified — every resource in this org, including ones this tooling created, carries the org's baseline `Admin` role and no clients regardless of what's requested, which looks like a server-side default rather than per-resource state either script manages. A resource with anything else attached is flagged as an anomaly in the report instead of being silently changed.
+
+---
+
 ## Notes
 
 - `config.yml` is git-ignored — never commit it; it contains credentials.
