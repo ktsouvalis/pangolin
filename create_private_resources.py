@@ -12,7 +12,7 @@ Config (config.yml, key-value, nested under 'pangolin'):
       api_key: "..."
 
 Requests sheet columns (see pangolin_private_resources_template.xlsx):
-    Name | Destination (IP or CIDR) | Alias | OS | User Emails | Notes
+    Name | Operation System | Destination (IP or CIDR) | Ports | Alias | User Emails | Notes
 
 Name: the city (filled in by the Digital Governance Unit, not the requester),
       used as the first segment of the computed resource name.
@@ -21,18 +21,19 @@ Alias: optional FQDN (e.g. "app.internal") to reach the resource by name instead
        of IP. Not applicable when Destination is a CIDR range; left blank most
        of the time.
 
-OS drives a fixed TCP port policy (UDP and ICMP are always blocked):
-    "Linux"    -> TCP 22,3389
-    "Windows"  -> TCP 23579
-Any other/blank value fails that row locally (no API call) rather than
-guessing a port policy.
+Ports: comma-separated TCP port numbers (e.g. "22,3389"), user-entered.
+       UDP and ICMP are always blocked, not user-configurable. Missing/blank
+       or any non-numeric token fails that row locally (no API call) rather
+       than guessing a port policy. Operation System is informational only
+       (no longer used to derive ports).
 
 User Emails: comma-separated. Each email becomes a separate site resource,
              named "<city>-<username>-<vlan>[-<z>]" where username is the part
-             of the email before "@", and vlan/z come from Destination's
-             10.x.y.z octets (y zero-padded to 2 digits, z not padded; z is
-             dropped for CIDR destinations). E.g. ktsouvalis@uop.gr at
-             10.23.2.50 with city "patra" -> patra-ktsouvalis-2302-50.
+             of the email before "@" with any "." removed (e.g. m.katsis ->
+             mkatsis), and vlan/z come from Destination's 10.x.y.z octets
+             (y zero-padded to 2 digits, z not padded; z is dropped for CIDR
+             destinations). E.g. ktsouvalis@uop.gr at 10.23.2.50 with city
+             "patra" -> patra-ktsouvalis-2302-50.
              Unresolved emails are skipped (no resource created) and reported
              as a FAIL row, never silently dropped from the report.
 
@@ -112,12 +113,15 @@ def build_user_index(cfg):
     return index
 
 
-# Fixed port policy keyed by the "Operation System" column. UDP and ICMP are
-# always blocked, so they're not user-configurable inputs (see CLAUDE.md).
-OS_TCP_PORTS = {
-    "linux": "22,3389",
-    "windows": "23579",
-}
+def parse_tcp_ports(raw_value):
+    """Parse the "Ports" column into a normalized comma-separated TCP port
+    string, or None if missing/invalid. UDP and ICMP are always blocked, so
+    they're not user-configurable inputs (see CLAUDE.md)."""
+    raw = str(raw_value).strip() if raw_value else ""
+    tokens = [p.strip() for p in raw.split(",") if p.strip()]
+    if not tokens or not all(p.isdigit() and 1 <= int(p) <= 65535 for p in tokens):
+        return None
+    return ",".join(tokens)
 
 
 def compute_vlan_z(destination, mode):
@@ -141,10 +145,10 @@ def parse_row(row_num, row, user_index):
     """Return (resolved_reqs, fail_results) for a row.
 
     Each User Emails entry becomes its own resource request; anything that
-    can't produce one (missing emails, bad OS, unparseable destination,
+    can't produce one (missing emails, bad Ports, unparseable destination,
     unresolved email) becomes a FAIL result instead, without calling the API.
     """
-    city, os_value, destination, alias, emails, notes = row
+    city, os_value, destination, ports_value, alias, emails, notes = row
     if not destination:
         return [], []
 
@@ -152,7 +156,8 @@ def parse_row(row_num, row, user_index):
     mode = "cidr" if "/" in destination else "host"
     alias = str(alias).strip() if alias else None
     os_display = str(os_value).strip() if os_value else ""
-    tcp_ports = OS_TCP_PORTS.get(os_display.lower())
+    ports_display = str(ports_value).strip() if ports_value else ""
+    tcp_ports = parse_tcp_ports(ports_value)
     city = str(city).strip() if city else ""
     notes_val = str(notes).strip() if notes else None
     vlan, z_val = compute_vlan_z(destination, mode)
@@ -176,7 +181,8 @@ def parse_row(row_num, row, user_index):
         email = raw_email.lower()
         if tcp_ports is None:
             fail_results.append(make_fail(raw_email,
-                f"invalid/missing OS {os_display!r} (expected 'Linux' or 'Windows')"))
+                f"invalid/missing Ports {ports_display!r} "
+                f"(expected comma-separated TCP port numbers)"))
             continue
         if vlan is None:
             fail_results.append(make_fail(raw_email,
@@ -186,7 +192,7 @@ def parse_row(row_num, row, user_index):
             fail_results.append(make_fail(raw_email, f"unresolved email: {raw_email}"))
             continue
 
-        username = email.split("@", 1)[0]
+        username = email.split("@", 1)[0].replace(".", "")
         name_parts = [city.lower(), username, vlan] + ([z_val] if z_val is not None else [])
         resource_name = "-".join(p for p in name_parts if p)
 
@@ -326,7 +332,7 @@ def main():
 
     wb = load_workbook(args.xlsx_path, data_only=True)
     ws = wb[args.sheet]
-    raw_rows = list(ws.iter_rows(min_row=2, max_col=6, values_only=True))
+    raw_rows = list(ws.iter_rows(min_row=2, max_col=7, values_only=True))
 
     requests_parsed, upfront_fails = [], []
     for i, row in enumerate(raw_rows, start=2):
