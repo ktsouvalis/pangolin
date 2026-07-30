@@ -251,10 +251,9 @@ python3 create_private_resources.py my_requests.xlsx
 python3 create_private_resources.py my_requests.xlsx --config /path/to/config.yml
 ```
 
-Requests sheet columns: `Name | Operation System | Destination (IP or CIDR) | Ports | Alias | User Emails | Notes`
+Requests sheet columns: `Name | Destination (IP or CIDR) | Ports | Alias | User Emails | Notes`
 
 - **Name**: the city, filled in by the Digital Governance Unit (not the requester) — it's the first segment of the computed resource name (see below), not a free-form label.
-- **Operation System**: `Linux` or `Windows`. Informational only — reported alongside the resource but no longer drives port selection.
 - **Destination**: a single IP is created as a `host` resource; a CIDR (e.g. `10.23.30.0/24`) as a `network` resource.
 - **Ports**: comma-separated TCP port numbers (e.g. `22,3389`), user-entered per row. UDP and ICMP are always blocked, not user-configurable. A blank value or any non-numeric token fails that row locally (no API call) rather than guessing a port policy.
 - **Alias**: optional FQDN (e.g. `app.internal`) to reach the resource by name instead of IP. Doesn't apply to CIDR rows; leave blank otherwise.

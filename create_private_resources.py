@@ -12,7 +12,7 @@ Config (config.yml, key-value, nested under 'pangolin'):
       api_key: "..."
 
 Requests sheet columns (see pangolin_private_resources_template.xlsx):
-    Name | Operation System | Destination (IP or CIDR) | Ports | Alias | User Emails | Notes
+    Name | Destination (IP or CIDR) | Ports | Alias | User Emails | Notes
 
 Name: the city (filled in by the Digital Governance Unit, not the requester),
       used as the first segment of the computed resource name.
@@ -24,8 +24,7 @@ Alias: optional FQDN (e.g. "app.internal") to reach the resource by name instead
 Ports: comma-separated TCP port numbers (e.g. "22,3389"), user-entered.
        UDP and ICMP are always blocked, not user-configurable. Missing/blank
        or any non-numeric token fails that row locally (no API call) rather
-       than guessing a port policy. Operation System is informational only
-       (no longer used to derive ports).
+       than guessing a port policy.
 
 User Emails: comma-separated. Each email becomes a separate site resource,
              named "<city>-<username>-<vlan>[-<z>]" where username is the part
@@ -154,14 +153,13 @@ def parse_row(row_num, row, user_index):
     can't produce one (missing emails, bad Ports, unparseable destination,
     unresolved email) becomes a FAIL result instead, without calling the API.
     """
-    city, os_value, destination, ports_value, alias, emails, notes = row
+    city, destination, ports_value, alias, emails, notes = row
     if not destination:
         return [], []
 
     destination = str(destination).strip()
     mode = "cidr" if "/" in destination else "host"
     alias = str(alias).strip() if alias else None
-    os_display = str(os_value).strip() if os_value else ""
     ports_display = str(ports_value).strip() if ports_value else ""
     tcp_ports = parse_tcp_ports(ports_value)
     city = str(city).strip() if city else ""
@@ -209,7 +207,6 @@ def parse_row(row_num, row, user_index):
             "name": resource_name,
             "mode": mode,
             "destination": destination,
-            "os": os_display,
             "tcpPortRangeString": tcp_ports,
             "udpPortRangeString": "",
             "disableIcmp": True,
@@ -225,7 +222,7 @@ def parse_row(row_num, row, user_index):
 
 
 def create_site_resource(cfg, sites, req, dry_run):
-    payload = {k: v for k, v in req.items() if not k.startswith("_") and k != "os"}
+    payload = {k: v for k, v in req.items() if not k.startswith("_")}
     payload["siteIds"] = [s["siteId"] for s in sites]
     site_names = ", ".join(s["name"] for s in sites)
     no_user = not req["_user_resolved"]
@@ -342,7 +339,7 @@ def main():
 
     wb = load_workbook(args.xlsx_path, data_only=True)
     ws = wb[args.sheet]
-    raw_rows = list(ws.iter_rows(min_row=2, max_col=7, values_only=True))
+    raw_rows = list(ws.iter_rows(min_row=2, max_col=6, values_only=True))
 
     requests_parsed, upfront_fails = [], []
     for i, row in enumerate(raw_rows, start=2):
@@ -359,7 +356,6 @@ def main():
         print(f"- row {req['_row_num']}: {req['name']} ({req['mode']}: {req['destination']}) "
               f"email={req['_email']} "
               f"alias={req.get('alias') or '-'} "
-              f"os={req['os'] or '-'} "
               f"tcp={req['tcpPortRangeString'] or 'blocked'} "
               f"udp=blocked icmp=blocked")
         all_results.append(create_site_resource(cfg, sites, req, args.dry_run))
