@@ -33,6 +33,12 @@ User Emails: comma-separated. Each email becomes a separate site resource,
              (y zero-padded to 2 digits, z not padded; z is dropped for CIDR
              destinations). E.g. ktsouvalis@uop.gr at 10.23.2.50 with city
              "patra" -> patra-ktsouvalis-2302-50.
+             The resource's niceId is also computed explicitly, instead of
+             left to Pangolin's own random generation on create:
+             "<username>-<vlan>[-<z>]-<ports>", ports being the row's TCP
+             Ports numerically sorted, each prefixed with "p" and dash-joined
+             (e.g. "3389,22" -> "p22-p3389"), e.g.
+             ktsouvalis-2302-50-p22-p3389.
              An email that doesn't match any current Pangolin user still gets
              its resource created (name computed the same way, since the name
              never depended on the user lookup) but with no user attached
@@ -146,6 +152,18 @@ def compute_vlan_z(destination, mode):
     return vlan, z_val
 
 
+def compute_nice_id(username, vlan, z_val, tcp_ports):
+    """"<username>-<vlan>[-<z>]-<ports>", ports numerically sorted, each
+    prefixed with "p" and dash-joined (e.g. "22,3389" -> "p22-p3389"). This
+    becomes the resource's niceId, set explicitly instead of leaving it to
+    Pangolin's own random generation on create.
+    """
+    ports_sorted = sorted((p for p in tcp_ports.split(",") if p), key=int)
+    ports_formatted = [f"p{p}" for p in ports_sorted]
+    parts = [username, vlan] + ([z_val] if z_val is not None else []) + ports_formatted
+    return "-".join(parts)
+
+
 def parse_row(row_num, row, user_index):
     """Return (resolved_reqs, fail_results) for a row.
 
@@ -196,6 +214,7 @@ def parse_row(row_num, row, user_index):
         username = email.split("@", 1)[0].replace(".", "")
         name_parts = [city.lower(), username, vlan] + ([z_val] if z_val is not None else [])
         resource_name = "-".join(p for p in name_parts if p)
+        nice_id = compute_nice_id(username, vlan, z_val, tcp_ports)
 
         user_id = user_index.get(email)
         req = {
@@ -205,6 +224,7 @@ def parse_row(row_num, row, user_index):
             "_email": raw_email,
             "_user_resolved": user_id is not None,
             "name": resource_name,
+            "niceId": nice_id,
             "mode": mode,
             "destination": destination,
             "tcpPortRangeString": tcp_ports,
@@ -238,7 +258,7 @@ def create_site_resource(cfg, sites, req, dry_run):
         "notes": req["_notes"],
         "sites": site_names,
         "status": None,
-        "nice_id": None,
+        "nice_id": req["niceId"],
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "error": (f"no user match: {req['_email']!r} not found among org users -- "
                   f"resource created without access, backfill later via "
@@ -353,7 +373,8 @@ def main():
 
     all_results = []
     for req in requests_parsed:
-        print(f"- row {req['_row_num']}: {req['name']} ({req['mode']}: {req['destination']}) "
+        print(f"- row {req['_row_num']}: {req['name']} (niceId={req['niceId']}) "
+              f"({req['mode']}: {req['destination']}) "
               f"email={req['_email']} "
               f"alias={req.get('alias') or '-'} "
               f"tcp={req['tcpPortRangeString'] or 'blocked'} "

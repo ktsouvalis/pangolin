@@ -35,20 +35,39 @@ For each in-scope resource:
       * 0 users assigned -> this is the expected state for a resource that
         create_private_resources.py created for an email that didn't match
         any org user yet (reported there as OK_NO_USER). Auto-resolved (no
-        confirmation needed) ONLY when the name is already an *exact* match
-        for the naming convention: peel the known city (name's first
-        segment) and the known vlan/tail (computed from the destination,
-        same as always) off the name, and if what's left is exactly one
-        org user's sanitized local part, that's not a guess -- it's the
-        literal reverse of create_private_resources.py's own naming
-        formula. Access is granted (action=grant_access), no rename needed
-        by construction. Anything looser (name doesn't exactly reconstruct,
-        or the leftover matches zero or multiple org users) stays
-        UNRESOLVED/skipped as before, with a best-effort suggested email
-        (looser: any name segment matching a sanitized local part) for a
-        human to confirm and apply by hand -- never auto-granted.
+        confirmation needed) when EITHER the name OR the niceId is already
+        an *exact* match for its respective naming convention:
+          - name: peel the known city (name's first segment) and the known
+            vlan/tail (computed from the destination, same as always) off
+            the name, and if what's left is exactly one org user's
+            sanitized local part, that's not a guess -- it's the literal
+            reverse of create_private_resources.py's own naming formula.
+          - niceId: same idea but from the other end -- peel the known
+            vlan/tail and the resource's own (already-known) ports segment
+            off the *end* of niceId, and if what's left at the front is
+            exactly one org user's sanitized local part, that's the literal
+            reverse of create_private_resources.py's niceId formula. Only
+            attempted when tcpPortRangeString is a plain numeric list (see
+            the niceId bullet above).
+        Whichever resolves first is used. Access is granted
+        (action=grant_access), no rename needed by construction. Anything
+        looser (neither reconstructs exactly, or the leftover matches zero
+        or multiple org users) stays UNRESOLVED/skipped as before, with a
+        best-effort suggested email (looser: any name segment matching a
+        sanitized local part) for a human to confirm and apply by hand --
+        never auto-granted.
   - rename: POST /site-resource/{id} {"name": ...} if the computed name
     differs from the current one.
+  - niceId: same POST /site-resource/{id} call (merged with the name fix
+    when both apply) sets niceId to "<username>-<vlan>-<tail>-<ports>" --
+    the target user's sanitized local part, the same vlan/tail segments as
+    the name, and the resource's own tcpPortRangeString ports numerically
+    sorted, each prefixed with "p" and dash-joined (e.g. "22-3389" ->
+    "p22-p3389") -- mirroring create_private_resources.py's own niceId
+    scheme (minus the city segment, which niceId never carried). Skipped
+    (niceId left untouched) when tcpPortRangeString isn't a plain
+    comma-separated numeric list (e.g. a "*" wildcard or a range) -- there's
+    no ports segment to compute in that case.
   - access: POST /site-resource/{id}/users {"userIds": [target]} if the
     current user set isn't already exactly {target} (this replaces the
     whole list in one call, pruning every other user at once).
@@ -170,9 +189,9 @@ def get_resource_clients(cfg, resource_id):
     return resp.json()["data"]["clients"]
 
 
-def rename_resource(cfg, resource_id, new_name):
+def update_resource(cfg, resource_id, fields):
     resp = session.post(f"{cfg['base_url']}/v1/site-resource/{resource_id}",
-                         headers=api_headers(cfg), json={"name": new_name})
+                         headers=api_headers(cfg), json=fields)
     resp.raise_for_status()
 
 
@@ -233,6 +252,50 @@ def compute_naming_segments(destination, mode):
     return None, None
 
 
+def compute_expected_ports(tcp_port_range_string):
+    """Parse a resource's tcpPortRangeString into sorted numeric port tokens
+    for niceId purposes, or None if it isn't a plain comma-separated numeric
+    list (e.g. a "*" wildcard, a range like "8000-9000", or blank) -- niceId
+    normalization is skipped in that case, since there's no discrete ports
+    segment to compute.
+    """
+    raw = (tcp_port_range_string or "").strip()
+    if not raw:
+        return None
+    tokens = [p.strip() for p in raw.split(",") if p.strip()]
+    if not tokens or not all(p.isdigit() for p in tokens):
+        return None
+    return sorted(tokens, key=int)
+
+
+def compute_expected_nice_id(username, vlan, tail, ports):
+    return "-".join([username, vlan, tail] + [f"p{p}" for p in ports])
+
+
+def resolve_unassigned_target_from_nice_id(nice_id, vlan, tail, ports, org_email_index):
+    """Strict reverse of create_private_resources.py's niceId formula
+    ("<username>-<vlan>-<tail>-<ports>"), for a resource with 0 users
+    currently assigned. Mirrors resolve_unassigned_target but peels from the
+    *end* of niceId (vlan/tail/ports are already independently known) since
+    niceId carries no city segment for a prefix. Returns (email, userId) or
+    (None, None) if niceId isn't an exact match, ports couldn't be computed,
+    or the leftover doesn't uniquely resolve.
+    """
+    if not nice_id or ports is None:
+        return None, None
+    suffix = "-" + "-".join([vlan, tail] + [f"p{p}" for p in ports])
+    lnice = nice_id.lower()
+    if not lnice.endswith(suffix):
+        return None, None
+    candidate_username = lnice[: -len(suffix)]
+    if not candidate_username or "-" in candidate_username:
+        return None, None
+    candidates = org_email_index.get(candidate_username, [])
+    if len(candidates) != 1:
+        return None, None
+    return candidates[0]
+
+
 def resolve_unassigned_target(name, city, vlan, tail, org_email_index):
     """Strict reverse of create_private_resources.py's naming formula, for a
     resource with 0 users currently assigned. Peels the known city and known
@@ -291,7 +354,8 @@ def resolve_target(name, users, org_email_index):
 def process_resource(cfg, res, org_email_index, apply_changes):
     resource_id = res["siteResourceId"]
     row = {
-        "resource_id": resource_id, "nice_id": res.get("niceId"), "mode": res["mode"],
+        "resource_id": resource_id, "nice_id": res.get("niceId"), "new_nice_id": res.get("niceId"),
+        "mode": res["mode"],
         "destination": res["destination"], "city": None, "target_email": None,
         "old_name": res["name"], "new_name": res["name"], "action": "none",
         "removed_users": None, "current_users": None, "roles": None, "clients": None,
@@ -319,6 +383,8 @@ def process_resource(cfg, res, org_email_index, apply_changes):
     city = name_parts[0].strip().lower()
     row["city"] = city
 
+    ports = compute_expected_ports(res.get("tcpPortRangeString"))
+
     users = get_resource_users(cfg, resource_id)
     row["current_users"] = ", ".join(u.get("email") or f"<no-email:{u.get('username')}>"
                                       for u in users) or "(none)"
@@ -328,14 +394,20 @@ def process_resource(cfg, res, org_email_index, apply_changes):
     role_names = sorted(r["name"] for r in roles)
     row["roles"] = ", ".join(role_names) or "(none)"
     row["clients"] = str(len(clients))
-    anomaly = None
+    notes = []
     if role_names != ["Admin"] or clients:
-        anomaly = (f"unexpected roles/clients (roles={role_names}, clients={len(clients)}) "
-                   f"-- not modified, review manually")
+        notes.append(f"unexpected roles/clients (roles={role_names}, clients={len(clients)}) "
+                      f"-- not modified, review manually")
+    if ports is None:
+        notes.append(f"niceId not checked: tcpPortRangeString "
+                      f"{res.get('tcpPortRangeString')!r} isn't a plain numeric list")
 
     if len(users) == 0:
         strict_email, strict_user_id = resolve_unassigned_target(
             res["name"], city, vlan, tail, org_email_index)
+        if not strict_email:
+            strict_email, strict_user_id = resolve_unassigned_target_from_nice_id(
+                res.get("niceId"), vlan, tail, ports, org_email_index)
     else:
         strict_email, strict_user_id = None, None
 
@@ -350,8 +422,8 @@ def process_resource(cfg, res, org_email_index, apply_changes):
         row["status"] = "SKIPPED"
         row["reason"] = unresolved_reason + (f" -- org directory suggests: {suggestion}"
                                               if suggestion else "")
-        if anomaly:
-            row["reason"] += f"; {anomaly}"
+        if notes:
+            row["reason"] += "; " + "; ".join(notes)
         return row
 
     row["target_email"] = target_email
@@ -359,7 +431,11 @@ def process_resource(cfg, res, org_email_index, apply_changes):
     expected_name = f"{city}-{username}-{vlan}-{tail}"
     row["new_name"] = expected_name
 
+    expected_nice_id = compute_expected_nice_id(username, vlan, tail, ports) if ports is not None else None
+    row["new_nice_id"] = expected_nice_id if expected_nice_id is not None else res.get("niceId")
+
     needs_rename = expected_name != res["name"]
+    needs_nice_id_fix = expected_nice_id is not None and expected_nice_id != (res.get("niceId") or "")
     current_ids = {u.get("userId") for u in users if u.get("userId")}
     needs_access_fix = current_ids != {target_user_id}
     removed_emails = [u.get("email") or f"<no-email:{u.get('username')}>"
@@ -367,30 +443,52 @@ def process_resource(cfg, res, org_email_index, apply_changes):
     if removed_emails:
         row["removed_users"] = ", ".join(removed_emails)
 
-    if not needs_rename and not needs_access_fix:
+    reason = "; ".join(notes) or None
+
+    if not needs_rename and not needs_nice_id_fix and not needs_access_fix:
         row["status"] = "OK"
-        row["reason"] = anomaly
+        row["reason"] = reason
         return row
 
     actions = []
     if needs_rename:
         actions.append("rename")
+    if needs_nice_id_fix:
+        actions.append("fix_nice_id")
     if needs_access_fix:
         actions.append("grant_access" if len(users) == 0 else "prune_access")
     row["action"] = "+".join(actions)
 
     if not apply_changes:
         row["status"] = "DRY-RUN"
-        row["reason"] = anomaly
+        row["reason"] = reason
         return row
 
     try:
+        update_fields = {}
         if needs_rename:
-            rename_resource(cfg, resource_id, expected_name)
+            update_fields["name"] = expected_name
+        if needs_nice_id_fix:
+            update_fields["niceId"] = expected_nice_id
+        if update_fields:
+            # Despite the swagger schema showing every field optional, this
+            # endpoint validates as if the whole resource were being
+            # resubmitted -- userIds/roleIds/clientIds/destination/siteIds
+            # all come back "required" on a partial update in practice. Echo
+            # back the current values unchanged for all of them (access, if
+            # it also needs fixing, is applied separately below via the
+            # dedicated /users endpoint; roles/clients/destination/siteIds
+            # are never modified by this script, see CLAUDE.md).
+            update_fields["userIds"] = [u.get("userId") for u in users if u.get("userId")]
+            update_fields["roleIds"] = [r["roleId"] for r in roles]
+            update_fields["clientIds"] = [c["clientId"] for c in clients]
+            update_fields["destination"] = res["destination"]
+            update_fields["siteIds"] = res["siteIds"]
+            update_resource(cfg, resource_id, update_fields)
         if needs_access_fix:
             set_resource_users(cfg, resource_id, [target_user_id])
         row["status"] = "OK"
-        row["reason"] = anomaly
+        row["reason"] = reason
     except requests.HTTPError as e:
         row["status"] = "FAIL"
         row["reason"] = f"{e.response.status_code}: {e.response.text[:400]}"
@@ -402,9 +500,9 @@ def write_report(rows, out_path):
     ws = wb.active
     ws.title = "Normalize Report"
 
-    headers = ["SiteResourceId", "NiceId", "Mode", "Destination", "City", "TargetEmail",
-               "OldName", "NewName", "Action", "RemovedUsers", "CurrentUsers", "Roles",
-               "Clients", "Status", "Reason", "Timestamp"]
+    headers = ["SiteResourceId", "NiceId", "NewNiceId", "Mode", "Destination", "City",
+               "TargetEmail", "OldName", "NewName", "Action", "RemovedUsers", "CurrentUsers",
+               "Roles", "Clients", "Status", "Reason", "Timestamp"]
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
     for c, h in enumerate(headers, start=1):
@@ -416,18 +514,18 @@ def write_report(rows, out_path):
     status_colors = {"OK": "C6EFCE", "FAIL": "FFC7CE", "DRY-RUN": "FFEB9C", "SKIPPED": "D9D9D9"}
     for r, row in enumerate(rows, start=2):
         values = [
-            row["resource_id"], row["nice_id"], row["mode"], row["destination"], row["city"],
-            row["target_email"], row["old_name"], row["new_name"], row["action"],
-            row["removed_users"], row["current_users"], row["roles"], row["clients"],
-            row["status"], row["reason"], row["timestamp"],
+            row["resource_id"], row["nice_id"], row["new_nice_id"], row["mode"],
+            row["destination"], row["city"], row["target_email"], row["old_name"],
+            row["new_name"], row["action"], row["removed_users"], row["current_users"],
+            row["roles"], row["clients"], row["status"], row["reason"], row["timestamp"],
         ]
         for c, v in enumerate(values, start=1):
             ws.cell(row=r, column=c, value=v)
         fill_color = status_colors.get(row["status"])
         if fill_color:
-            ws.cell(row=r, column=14).fill = PatternFill("solid", fgColor=fill_color)
+            ws.cell(row=r, column=15).fill = PatternFill("solid", fgColor=fill_color)
 
-    widths = [8, 26, 6, 16, 12, 24, 24, 24, 18, 26, 30, 12, 8, 10, 50, 18]
+    widths = [8, 26, 26, 6, 16, 12, 24, 24, 24, 18, 26, 30, 12, 8, 10, 50, 18]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
 
@@ -473,6 +571,7 @@ def main():
         if row["action"] != "none" or row["status"] == "SKIPPED":
             print(f"  [{row['status']}] siteResourceId={row['resource_id']} "
                   f"'{row['old_name']}' -> '{row['new_name']}' "
+                  f"niceId '{row['nice_id']}' -> '{row['new_nice_id']}' "
                   f"action={row['action']} reason={row['reason'] or '-'}")
 
     counts = {}
