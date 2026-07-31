@@ -272,6 +272,39 @@ def sanitize_username(email):
     return email.split("@", 1)[0].strip().lower().replace(".", "")
 
 
+# Some org accounts exist twice under the same sanitized local part on
+# different domains (confirmed live: ktsouvalis@uop.gr / ktsouvalis@go.uop.gr
+# both sanitize to "ktsouvalis") -- lower index = higher priority.
+EMAIL_DOMAIN_PRIORITY = ["uop.gr", "go.uop.gr"]
+
+
+def pick_unique_candidate(candidates):
+    """From a list of (email, userId) pairs that all share one sanitized
+    local part (i.e. candidates for the *same* username, not candidates for
+    different name segments -- see find_unique_segment_match for that case),
+    return the one to use, or (None, None) if still ambiguous.
+
+    A single candidate is used as-is. Multiple candidates are resolved via
+    EMAIL_DOMAIN_PRIORITY (e.g. the university's main domain over its "go."
+    alias) -- but only when that preference is itself unambiguous (exactly
+    one candidate on the best-ranked domain present among them); still
+    refuses to guess if two candidates tie on the same domain rank.
+    """
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        return None, None
+
+    def domain_rank(email):
+        domain = email.split("@", 1)[1] if "@" in email else ""
+        return (EMAIL_DOMAIN_PRIORITY.index(domain)
+                if domain in EMAIL_DOMAIN_PRIORITY else len(EMAIL_DOMAIN_PRIORITY))
+
+    best_rank = min(domain_rank(e) for e, _ in candidates)
+    best = [(e, uid) for e, uid in candidates if domain_rank(e) == best_rank]
+    return best[0] if len(best) == 1 else (None, None)
+
+
 def compute_vlan_z(destination):
     """10.x.y.z only -> (vlan, z), e.g. 10.23.2.50 -> ("2302", "50"). Anything
     else (not 4 numeric octets, or first octet isn't literally "10") -> (None, None)."""
@@ -357,10 +390,7 @@ def resolve_unassigned_target_from_nice_id(nice_id, vlan, tail, ports, org_email
     candidate_username = lnice[: -len(suffix)]
     if not candidate_username or "-" in candidate_username:
         return None, None
-    candidates = org_email_index.get(candidate_username, [])
-    if len(candidates) != 1:
-        return None, None
-    return candidates[0]
+    return pick_unique_candidate(org_email_index.get(candidate_username, []))
 
 
 def resolve_unassigned_target(name, city, vlan, tail, org_email_index):
@@ -382,10 +412,7 @@ def resolve_unassigned_target(name, city, vlan, tail, org_email_index):
     candidate_username = lname[len(prefix):-len(suffix)]
     if not candidate_username or "-" in candidate_username:
         return None, None
-    candidates = org_email_index.get(candidate_username, [])
-    if len(candidates) != 1:
-        return None, None
-    return candidates[0]
+    return pick_unique_candidate(org_email_index.get(candidate_username, []))
 
 
 def find_unique_segment_match(name, org_email_index):
@@ -396,12 +423,21 @@ def find_unique_segment_match(name, org_email_index):
     zero or multiple org users match. Used both as the auto-apply fallback
     for 0-user resources (once the strict reconstruction fails) and as the
     best-effort suggestion surfaced for ambiguous 2+ user resources (never
-    auto-applied there -- see resolve_target)."""
+    auto-applied there -- see resolve_target).
+
+    Each segment is resolved independently via pick_unique_candidate() --
+    NOT a single pick_unique_candidate() call over every candidate pooled
+    across all segments -- specifically so the EMAIL_DOMAIN_PRIORITY
+    tie-break only ever breaks a tie between two accounts of the *same*
+    username (the segment they both came from), and never gets a chance to
+    pick between two genuinely different people who happen to match two
+    different segments of the name (that must still come back ambiguous).
+    """
     if not name:
         return None, None
     name_segments = set(name.lower().split("-"))
-    candidates = sorted({(e, uid) for seg in name_segments
-                          for e, uid in org_email_index.get(seg, [])})
+    per_segment = (pick_unique_candidate(org_email_index.get(seg, [])) for seg in name_segments)
+    candidates = sorted({c for c in per_segment if c != (None, None)})
     return candidates[0] if len(candidates) == 1 else (None, None)
 
 
