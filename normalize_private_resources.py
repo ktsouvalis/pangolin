@@ -34,9 +34,8 @@ For each in-scope resource:
         owner among several grantees). Otherwise AMBIGUOUS, skipped.
       * 0 users assigned -> this is the expected state for a resource that
         create_private_resources.py created for an email that didn't match
-        any org user yet (reported there as OK_NO_USER). Auto-resolved (no
-        confirmation needed) when EITHER the name OR the niceId is already
-        an *exact* match for its respective naming convention:
+        any org user yet (reported there as OK_NO_USER). Resolved (no
+        confirmation needed) in this order:
           - name: peel the known city (name's first segment) and the known
             vlan/tail (computed from the destination, same as always) off
             the name, and if what's left is exactly one org user's
@@ -49,13 +48,19 @@ For each in-scope resource:
             reverse of create_private_resources.py's niceId formula. Only
             attempted when tcpPortRangeString is a plain numeric list (see
             the niceId bullet above).
+          - as of 2026-07-31: if both of the above fail, fall back to
+            find_unique_segment_match() -- exactly one org user's sanitized
+            local part appears as *any* standalone name segment, not
+            necessarily in the specific position the exact reconstructions
+            above require. Catches legacy/hand-created names that don't fit
+            the computed city+vlan/tail shape at all. Still refuses to
+            guess when more than one (or zero) org users match.
         Whichever resolves first is used. Access is granted
-        (action=grant_access), no rename needed by construction. Anything
-        looser (neither reconstructs exactly, or the leftover matches zero
-        or multiple org users) stays UNRESOLVED/skipped as before, with a
-        best-effort suggested email (looser: any name segment matching a
-        sanitized local part) for a human to confirm and apply by hand --
-        never auto-granted.
+        (action=grant_access), no rename needed by construction. Still
+        UNRESOLVED/skipped when the leftover/segment match is zero or
+        ambiguous, with a best-effort suggested email for a human to
+        confirm and apply by hand -- never auto-granted on an ambiguous
+        match.
   - rename: POST /site-resource/{id} {"name": ...} if the computed name
     differs from the current one.
   - niceId: same POST /site-resource/{id} call (merged with the name fix
@@ -67,10 +72,23 @@ For each in-scope resource:
     scheme (minus the city segment, which niceId never carried). Skipped
     (niceId left untouched) when tcpPortRangeString isn't a plain
     comma-separated numeric list (e.g. a "*" wildcard or a range) -- there's
-    no ports segment to compute in that case.
+    no ports segment to compute in that case. As of 2026-07-31,
+    create_private_resources.py no longer sets niceId at all on creation
+    (left to Pangolin's random default) -- this script is now the only
+    place a deterministic niceId is ever assigned, for every resource
+    regardless of how it was created.
   - access: POST /site-resource/{id}/users {"userIds": [target]} if the
-    current user set isn't already exactly {target} (this replaces the
-    whole list in one call, pruning every other user at once).
+    current user set isn't already exactly {target}. As of 2026-07-31, any
+    *other* currently-assigned user with a resolvable email/userId is no
+    longer just dropped by this call -- they're split off into their own
+    new resource first (create_split_resource(): same destination/ports,
+    spanning every org site, named/niceId'd for just them, mirroring
+    create_private_resources.py's one-resource-per-user model) so pruning
+    the original never silently revokes someone's access. A user with no
+    resolvable email (rare, seen on some legacy resources) has no target to
+    split to and is still just dropped. If any split creation fails, the
+    original resource is left untouched rather than pruning access with
+    nowhere for it to have gone.
   - Roles/clients are read (for the report) but never modified: every
     resource surveyed in this org -- both hand-created legacy ones and
     ones already produced by create_private_resources.py -- uniformly
@@ -78,6 +96,13 @@ For each in-scope resource:
     looks like server-side default behavior rather than per-resource state
     either script manages. A resource with anything else attached is
     flagged as an anomaly in the report rather than silently touched.
+  - tcpPortRangeString/udpPortRangeString/disableIcmp are read but never
+    intentionally changed by this script -- however, every POST update
+    call re-asserts the resource's own current values for these explicitly.
+    Confirmed live Pangolin API behavior: omitting them on an update doesn't
+    leave them alone, it resets udpPortRangeString from blocked back to
+    "all" on the resource being edited. Do not remove this echo-back to
+    "simplify" the payload.
 
 Defaults to a dry run: everything above is computed and reported, but no
 API calls that change state are made. Pass --apply to actually rename
@@ -201,6 +226,48 @@ def set_resource_users(cfg, resource_id, user_ids):
     resp.raise_for_status()
 
 
+def get_sites(cfg):
+    """Same call create_private_resources.py makes -- every resource this
+    tooling creates (from an xlsx row, or split off a multi-user legacy
+    resource here) spans every site in the org for HA."""
+    sites = get_all_pages(cfg, f"/org/{cfg['org_slug']}/sites", "sites")
+    if not sites:
+        sys.exit("ERROR: no sites found in this org.")
+    return sites
+
+
+def create_split_resource(cfg, sites, res, city, vlan, tail, ports, email, user_id):
+    """Create a new site-resource for a user being split off a multi-user
+    resource (see process_resource) -- same destination/ports/alias as the
+    resource they're being split from, but named and owned for just them.
+    Unlike create_private_resources.py's own rows, the target user is
+    already fully resolved here, so niceId is set immediately rather than
+    left random."""
+    username = sanitize_username(email)
+    name = f"{city}-{username}-{vlan}-{tail}"
+    payload = {
+        "name": name,
+        "mode": res["mode"],
+        "destination": res["destination"],
+        "tcpPortRangeString": res.get("tcpPortRangeString") or "",
+        "udpPortRangeString": "",
+        "disableIcmp": True,
+        "roleIds": [],
+        "clientIds": [],
+        "userIds": [user_id],
+        "siteIds": [s["siteId"] for s in sites],
+    }
+    if ports is not None:
+        payload["niceId"] = compute_expected_nice_id(username, vlan, tail, ports)
+    if res.get("alias"):
+        payload["alias"] = res["alias"]
+
+    resp = session.put(f"{cfg['base_url']}/v1/org/{cfg['org_slug']}/site-resource",
+                        headers=api_headers(cfg), json=payload)
+    resp.raise_for_status()
+    return resp.json()["data"]
+
+
 def sanitize_username(email):
     return email.split("@", 1)[0].strip().lower().replace(".", "")
 
@@ -321,6 +388,23 @@ def resolve_unassigned_target(name, city, vlan, tail, org_email_index):
     return candidates[0]
 
 
+def find_unique_segment_match(name, org_email_index):
+    """Loosest resolution: exactly one org user's sanitized local part
+    appears as a standalone "-"-separated segment of the name (not
+    necessarily in the specific city/vlan/tail positions the strict
+    reconstruction requires). Returns (email, userId), or (None, None) if
+    zero or multiple org users match. Used both as the auto-apply fallback
+    for 0-user resources (once the strict reconstruction fails) and as the
+    best-effort suggestion surfaced for ambiguous 2+ user resources (never
+    auto-applied there -- see resolve_target)."""
+    if not name:
+        return None, None
+    name_segments = set(name.lower().split("-"))
+    candidates = sorted({(e, uid) for seg in name_segments
+                          for e, uid in org_email_index.get(seg, [])})
+    return candidates[0] if len(candidates) == 1 else (None, None)
+
+
 def resolve_target(name, users, org_email_index):
     """Return (target_email, target_user_id, reason_if_unresolved, suggested_email).
 
@@ -332,10 +416,8 @@ def resolve_target(name, users, org_email_index):
     resolved = [(u.get("email"), u.get("userId")) for u in users if u.get("email")]
 
     if len(users) == 0:
-        candidates = sorted({e for seg in name_segments
-                              for e, _ in org_email_index.get(seg, [])})
-        suggestion = candidates[0] if len(candidates) == 1 else None
-        return None, None, "no users currently assigned", suggestion
+        suggested_email, _ = find_unique_segment_match(name, org_email_index)
+        return None, None, "no users currently assigned", suggested_email
 
     if len(resolved) == 1 and len(users) == 1:
         email, uid = resolved[0]
@@ -351,7 +433,7 @@ def resolve_target(name, users, org_email_index):
     return None, None, f"{len(users)} users assigned, ambiguous ({emails_desc})", None
 
 
-def process_resource(cfg, res, org_email_index, apply_changes):
+def process_resource(cfg, sites, res, org_email_index, apply_changes):
     resource_id = res["siteResourceId"]
     row = {
         "resource_id": resource_id, "nice_id": res.get("niceId"), "new_nice_id": res.get("niceId"),
@@ -408,6 +490,16 @@ def process_resource(cfg, res, org_email_index, apply_changes):
         if not strict_email:
             strict_email, strict_user_id = resolve_unassigned_target_from_nice_id(
                 res.get("niceId"), vlan, tail, ports, org_email_index)
+        if not strict_email:
+            # As of 2026-07-31: the strict reconstruction only works when the
+            # name/niceId already fits this convention's exact shape, which
+            # legacy hand-created resources with no city/vlan/tail structure
+            # never will. Falling back to "exactly one org user's sanitized
+            # local part appears as a standalone name segment" (previously
+            # only ever surfaced as a manual-review suggestion, see
+            # resolve_target) catches those too, while still refusing to
+            # guess when that match isn't unique.
+            strict_email, strict_user_id = find_unique_segment_match(res["name"], org_email_index)
     else:
         strict_email, strict_user_id = None, None
 
@@ -438,10 +530,23 @@ def process_resource(cfg, res, org_email_index, apply_changes):
     needs_nice_id_fix = expected_nice_id is not None and expected_nice_id != (res.get("niceId") or "")
     current_ids = {u.get("userId") for u in users if u.get("userId")}
     needs_access_fix = current_ids != {target_user_id}
-    removed_emails = [u.get("email") or f"<no-email:{u.get('username')}>"
-                       for u in users if u.get("userId") != target_user_id]
-    if removed_emails:
-        row["removed_users"] = ", ".join(removed_emails)
+
+    # As of 2026-07-31: a user other than the resolved target no longer just
+    # loses access when this resource gets pruned down to one owner -- they
+    # get their own new resource instead (same destination/ports, spanning
+    # every org site, mirroring create_private_resources.py's one-resource-
+    # per-user model), so multi-user legacy resources can be split apart
+    # without silently dropping anyone's access. A user with no resolvable
+    # email/userId (seen on some legacy resources) can't be split off (there's
+    # no target to create a resource for) and is still just pruned.
+    split_off_users = [(u.get("email").lower(), u.get("userId")) for u in users
+                        if u.get("userId") != target_user_id and u.get("email") and u.get("userId")]
+    unsplittable_users = [u.get("username") or u.get("userId") for u in users
+                           if u.get("userId") != target_user_id and not u.get("email")]
+    removed_desc = [f"{e} -> new resource" for e, _ in split_off_users]
+    removed_desc += [f"<no-email:{u}> -> dropped (no email to split to)" for u in unsplittable_users]
+    if removed_desc:
+        row["removed_users"] = ", ".join(removed_desc)
 
     reason = "; ".join(notes) or None
 
@@ -456,7 +561,8 @@ def process_resource(cfg, res, org_email_index, apply_changes):
     if needs_nice_id_fix:
         actions.append("fix_nice_id")
     if needs_access_fix:
-        actions.append("grant_access" if len(users) == 0 else "prune_access")
+        actions.append("grant_access" if len(users) == 0 else
+                        ("split_access" if split_off_users else "prune_access"))
     row["action"] = "+".join(actions)
 
     if not apply_changes:
@@ -465,6 +571,20 @@ def process_resource(cfg, res, org_email_index, apply_changes):
         return row
 
     try:
+        # Split off every other user into their own resource *before*
+        # touching the original -- if any of these fails, the original is
+        # left untouched rather than pruning someone's access with nowhere
+        # for it to have gone.
+        created = []
+        for email, user_id in split_off_users:
+            new_res = create_split_resource(cfg, sites, res, city, vlan, tail, ports, email, user_id)
+            created.append(f"{email} -> siteResourceId={new_res['siteResourceId']} "
+                            f"niceId={new_res['niceId']}")
+        if created:
+            row["removed_users"] = ", ".join(created + [
+                f"<no-email:{u}> -> dropped (no email to split to)" for u in unsplittable_users
+            ])
+
         update_fields = {}
         if needs_rename:
             update_fields["name"] = expected_name
@@ -484,6 +604,16 @@ def process_resource(cfg, res, org_email_index, apply_changes):
             update_fields["clientIds"] = [c["clientId"] for c in clients]
             update_fields["destination"] = res["destination"]
             update_fields["siteIds"] = res["siteIds"]
+            # As of 2026-07-31: also echo back tcp/udp/icmp unchanged.
+            # Confirmed live Pangolin behavior -- an update that omits these
+            # doesn't just leave them at their swagger-documented "optional"
+            # default, it resets udpPortRangeString from blocked back to
+            # "all" on the resource being edited. This script never intends
+            # to touch ports/icmp, so always re-assert the resource's own
+            # current values rather than let the API silently open UDP.
+            update_fields["tcpPortRangeString"] = res.get("tcpPortRangeString") or ""
+            update_fields["udpPortRangeString"] = res.get("udpPortRangeString") or ""
+            update_fields["disableIcmp"] = res.get("disableIcmp", True)
             update_resource(cfg, resource_id, update_fields)
         if needs_access_fix:
             set_resource_users(cfg, resource_id, [target_user_id])
@@ -546,6 +676,7 @@ def main():
 
     cfg = load_config(args.config)
     verify_org(cfg)
+    sites = get_sites(cfg)
 
     resources = get_site_resources(cfg)
     if args.resource_id:
@@ -566,7 +697,7 @@ def main():
 
     rows = []
     for res in resources:
-        row = process_resource(cfg, res, org_email_index, args.apply)
+        row = process_resource(cfg, sites, res, org_email_index, args.apply)
         rows.append(row)
         if row["action"] != "none" or row["status"] == "SKIPPED":
             print(f"  [{row['status']}] siteResourceId={row['resource_id']} "
