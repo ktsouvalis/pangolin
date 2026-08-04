@@ -27,28 +27,37 @@ Ports: comma-separated TCP port numbers (e.g. "22,3389"), user-entered.
        than guessing a port policy.
 
 User Emails: comma-separated. Each email becomes a separate site resource,
-             named "<city>-<username>-<vlan>[-<z>]" where username is the part
-             of the email before "@" with any "." removed (e.g. m.katsis ->
-             mkatsis), and vlan/z come from Destination's 10.x.y.z octets
-             (y zero-padded to 2 digits, z not padded; z is dropped for CIDR
-             destinations). E.g. ktsouvalis@uop.gr at 10.23.2.50 with city
+             named "<city>-<username>-<vlan>-<tail>" where username is the
+             part of the email before "@" with any "." removed (e.g.
+             m.katsis -> mkatsis), vlan/tail come from Destination's 10.x.y.z
+             octets (host: vlan = x+y zero-padded, tail = unpadded z; CIDR:
+             vlan built from whichever octets the prefix fixes, tail "all"
+             for a /24 or the literal prefix length otherwise -- identical
+             rule to normalize_private_resources.py's, see its module
+             docstring). E.g. ktsouvalis@uop.gr at 10.23.2.50 with city
              "patra" -> patra-ktsouvalis-2302-50.
-             As of 2026-07-31, niceId is left to Pangolin's own random
-             generation on create instead -- normalize_private_resources.py
-             is now the single place that ever sets a deterministic niceId,
-             for every resource regardless of how it was created (this
-             script's rows, hand-created legacy ones, or ones split off a
-             multi-user resource by normalize_ itself). Run it afterward to
-             assign a real niceId once a resource has (or gets) a resolved
-             owner.
+             As of 2026-08-04 (once Pangolin exposed a per-resource `enabled`
+             switch), niceId is set deterministically at create time too --
+             "<username>-<vlan>-<tail>-<ports>", same formula
+             normalize_private_resources.py uses -- regardless of whether the
+             email matches a current org user, since the username segment
+             only ever depended on the email string, never on a resolved
+             account. Before this, niceId was deliberately left to Pangolin's
+             own random generation specifically so a still-random niceId
+             could signal "nobody's assigned yet" -- with `enabled` that
+             trick is no longer needed; disabled state is now the explicit
+             signal instead (see the `enabled` bullet below).
              An email that doesn't match any current Pangolin user still gets
-             its resource created (name computed the same way, since the name
-             never depended on the user lookup) but with no user attached
-             (userIds: []); reported as OK_NO_USER / DRY-RUN_NO_USER rather
-             than silently dropped or failed. Run normalize_private_resources.py
-             later, once the account exists, to backfill access -- it looks
-             for exactly this pattern (correctly-named resource, 0 users) and
-             reverses the naming formula to find the matching org user.
+             its resource created (name/niceId computed the same way, since
+             neither ever depended on the user lookup) but with no user
+             attached (userIds: []) and `enabled: false`; reported as
+             OK_NO_USER / DRY-RUN_NO_USER rather than silently dropped or
+             failed -- its baseline Admin-role default access (see CLAUDE.md)
+             shouldn't be reachable by anyone until it has a real owner. Run
+             normalize_private_resources.py later, once the account exists,
+             to backfill access and flip `enabled` on -- it looks for exactly
+             this pattern (correctly-named resource, 0 users) and reverses
+             the naming formula to find the matching org user.
 
 Usage:
     python3 create_private_resources.py requests.xlsx --dry-run
@@ -137,21 +146,62 @@ def parse_tcp_ports(raw_value):
     return ",".join(tokens)
 
 
-def compute_vlan_z(destination, mode):
-    """Derive the vlan/z name segments from a 10.x.y.z destination.
-
-    vlan = x concatenated with y zero-padded to 2 digits (e.g. 10.23.2.50 ->
-    "2302"); z is the 4th octet, not padded, and omitted entirely for CIDR
-    destinations (no single host octet to point at).
+def compute_vlan_z(destination):
+    """10.x.y.z host -> (vlan, tail), e.g. 10.23.2.50 -> ("2302", "50").
+    vlan = x concatenated with y zero-padded to 2 digits; tail is the 4th
+    octet, unpadded. (None, None) if not 4 numeric octets or not a 10.x.y.z
+    address. Kept identical to normalize_private_resources.py's function of
+    the same name -- both scripts must agree on this exactly, since
+    normalize_ is what later audits/fixes whatever create_ produces.
     """
-    ip_part = destination.split("/", 1)[0].strip()
-    parts = ip_part.split(".")
-    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+    parts = destination.strip().split(".")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts) or parts[0] != "10":
         return None, None
     x, y, z = parts[1], parts[2], parts[3]
-    vlan = f"{int(x)}{int(y):02d}"
-    z_val = None if mode == "cidr" else str(int(z))
-    return vlan, z_val
+    return f"{int(x)}{int(y):02d}", str(int(z))
+
+
+def compute_cidr_vlan_tail(destination):
+    """10.x.y.z/prefix -> (vlan, tail), tail "all" for the common /24 case or
+    the literal prefix length otherwise (e.g. "/16" -> tail "16"); (None,
+    None) if the mask is narrower than /16 (too broad to name a single
+    owner's slice). Kept identical to normalize_private_resources.py's
+    function of the same name -- see compute_vlan_z's docstring above.
+    """
+    ip_part, sep, prefix_str = destination.strip().partition("/")
+    if not sep or not prefix_str.isdigit():
+        return None, None
+    prefix = int(prefix_str)
+    parts = ip_part.split(".")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts) or parts[0] != "10":
+        return None, None
+    x, y, z = parts[1], parts[2], parts[3]
+    fixed_octets = max(0, min(3, prefix // 8 - 1))
+    if fixed_octets == 0:
+        return None, None
+    vlan_tokens = [str(int(x))]
+    if fixed_octets >= 2:
+        vlan_tokens.append(f"{int(y):02d}")
+    if fixed_octets >= 3:
+        vlan_tokens.append(str(int(z)))
+    tail = "all" if prefix == 24 else str(prefix)
+    return "".join(vlan_tokens), tail
+
+
+def compute_naming_segments(destination, mode):
+    """Dispatch to the host or cidr vlan/tail computation for `mode`."""
+    if mode == "host":
+        return compute_vlan_z(destination)
+    if mode == "cidr":
+        return compute_cidr_vlan_tail(destination)
+    return None, None
+
+
+def compute_expected_nice_id(username, vlan, tail, ports):
+    """"<username>-<vlan>-<tail>-<ports>", ports as sorted "pNNN" tokens.
+    Identical formula to normalize_private_resources.py's function of the
+    same name -- kept in sync deliberately, see module docstring."""
+    return "-".join([username, vlan, tail] + [f"p{p}" for p in sorted(ports, key=int)])
 
 
 def parse_row(row_num, row, user_index):
@@ -172,7 +222,7 @@ def parse_row(row_num, row, user_index):
     tcp_ports = parse_tcp_ports(ports_value)
     city = str(city).strip() if city else ""
     notes_val = str(notes).strip() if notes else None
-    vlan, z_val = compute_vlan_z(destination, mode)
+    vlan, tail = compute_naming_segments(destination, mode)
 
     raw_emails = [e.strip() for e in str(emails or "").split(",") if e.strip()]
 
@@ -180,7 +230,7 @@ def parse_row(row_num, row, user_index):
         return {
             "row_num": row_num, "city": city, "name": None, "destination": destination,
             "alias": alias, "tcp_ports": tcp_ports, "email": email, "notes": notes_val,
-            "sites": None, "status": "FAIL", "nice_id": None,
+            "sites": None, "status": "FAIL", "nice_id": None, "enabled": None,
             "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "error": error,
         }
@@ -198,12 +248,13 @@ def parse_row(row_num, row, user_index):
             continue
         if vlan is None:
             fail_results.append(make_fail(raw_email,
-                f"destination {destination!r} is not a valid IPv4 host/CIDR"))
+                f"destination {destination!r} is not a valid 10.x.y.z IPv4 host/CIDR "
+                f"(or the CIDR mask is too broad to name a single owner's slice)"))
             continue
 
         username = email.split("@", 1)[0].replace(".", "")
-        name_parts = [city.lower(), username, vlan] + ([z_val] if z_val is not None else [])
-        resource_name = "-".join(p for p in name_parts if p)
+        resource_name = "-".join([city.lower(), username, vlan, tail])
+        nice_id = compute_expected_nice_id(username, vlan, tail, tcp_ports.split(","))
 
         user_id = user_index.get(email)
         req = {
@@ -221,6 +272,14 @@ def parse_row(row_num, row, user_index):
             "roleIds": [],
             "clientIds": [],
             "userIds": [user_id] if user_id is not None else [],
+            "niceId": nice_id,
+            # Enabled only when a live org account was actually matched --
+            # a resource created for an email that doesn't exist in Pangolin
+            # yet stays disabled (its baseline Admin-role default access
+            # shouldn't be reachable by anyone until it has a real owner);
+            # normalize_private_resources.py flips it on once the account
+            # exists and access is granted. See module docstring.
+            "enabled": user_id is not None,
         }
         if alias:
             req["alias"] = alias
@@ -246,10 +305,12 @@ def create_site_resource(cfg, sites, req, dry_run):
         "notes": req["_notes"],
         "sites": site_names,
         "status": None,
-        # Not set at request time (see module docstring) -- filled in below
-        # from the API's own response once a live create actually succeeds;
-        # stays None for a dry run, since the real value is Pangolin's choice.
-        "nice_id": None,
+        # Set deterministically at request-build time (see module docstring)
+        # -- shown here already for a dry run; overwritten with the API's own
+        # echoed value below once a live create actually succeeds (should
+        # always match what was sent).
+        "nice_id": req["niceId"],
+        "enabled": req["enabled"],
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "error": (f"no user match: {req['_email']!r} not found among org users -- "
                   f"resource created without access, backfill later via "
@@ -286,7 +347,7 @@ def write_report(input_path, results):
     ws = wb.create_sheet("Results")
 
     headers = ["Row", "City", "Name", "Destination", "Alias", "TCP Ports", "Email", "Notes", "Sites",
-               "Status", "Nice ID", "Timestamp", "Error"]
+               "Status", "Nice ID", "Enabled", "Timestamp", "Error"]
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
 
@@ -308,7 +369,7 @@ def write_report(input_path, results):
         values = [
             res["row_num"], res["city"], res["name"], res["destination"], res["alias"],
             res["tcp_ports"], res["email"], res["notes"], res["sites"],
-            res["status"], res["nice_id"], res["timestamp"], res["error"],
+            res["status"], res["nice_id"], res["enabled"], res["timestamp"], res["error"],
         ]
         for c, v in enumerate(values, start=1):
             ws.cell(row=r, column=c, value=v)
@@ -316,7 +377,7 @@ def write_report(input_path, results):
         if fill_color:
             ws.cell(row=r, column=10).fill = PatternFill("solid", fgColor=fill_color)
 
-    widths = [6, 14, 24, 22, 22, 14, 26, 30, 30, 10, 26, 18, 40]
+    widths = [6, 14, 24, 22, 22, 14, 26, 30, 30, 10, 26, 10, 18, 40]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
 
@@ -364,12 +425,13 @@ def main():
 
     all_results = []
     for req in requests_parsed:
-        print(f"- row {req['_row_num']}: {req['name']} (niceId=<assigned by API>) "
+        print(f"- row {req['_row_num']}: {req['name']} (niceId={req['niceId']}) "
               f"({req['mode']}: {req['destination']}) "
               f"email={req['_email']} "
               f"alias={req.get('alias') or '-'} "
               f"tcp={req['tcpPortRangeString'] or 'blocked'} "
-              f"udp=blocked icmp=blocked")
+              f"udp=blocked icmp=blocked "
+              f"enabled={req['enabled']}")
         all_results.append(create_site_resource(cfg, sites, req, args.dry_run))
 
     for fail in upfront_fails:

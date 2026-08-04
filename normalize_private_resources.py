@@ -72,11 +72,32 @@ For each in-scope resource:
     scheme (minus the city segment, which niceId never carried). Skipped
     (niceId left untouched) when tcpPortRangeString isn't a plain
     comma-separated numeric list (e.g. a "*" wildcard or a range) -- there's
-    no ports segment to compute in that case. As of 2026-07-31,
-    create_private_resources.py no longer sets niceId at all on creation
-    (left to Pangolin's random default) -- this script is now the only
-    place a deterministic niceId is ever assigned, for every resource
-    regardless of how it was created.
+    no ports segment to compute in that case. As of 2026-08-04,
+    create_private_resources.py also sets this same deterministic niceId at
+    create time (the username segment only ever needs the raw email string,
+    not a resolved account, so it doesn't need to wait for this script) --
+    this script remains the enforcer/fallback for every resource regardless
+    of how it was created (hand-created legacy ones, or ones split off a
+    multi-user resource by this script itself), not the only place niceId
+    is ever computed anymore.
+  - enabled: as of 2026-08-04, once Pangolin exposed a per-resource
+    `enabled` switch, this script keeps it in lockstep with whether a target
+    user is actually resolved -- POST /site-resource/{id} {"enabled": ...}
+    (merged into the same rename/niceId-fix update call when any of them
+    apply). A resource with 0 users that still can't be resolved to a
+    target is disabled (action=disable_no_user) if it isn't already --
+    its baseline "Admin"-role default access (see the roles/clients bullet
+    below) shouldn't be reachable by anyone while it's unowned. A resource
+    that DOES resolve a target (whether via the 0-user grant, an
+    already-assigned single user, or a 2+-user primary) is enabled
+    (action includes "enable") if it wasn't already. This replaces the old
+    "niceId was left random specifically so a still-random niceId could
+    signal unassigned" trick from before `enabled` existed -- `enabled` is
+    now that explicit signal, so niceId no longer needs to double as one.
+    2+-user AMBIGUOUS resources (real users assigned, just no resolvable
+    primary) are left alone either way -- enabled only ever tracks the
+    0-user axis, never touched for a resource that already has someone's
+    access on it.
   - access: POST /site-resource/{id}/users {"userIds": [target]} if the
     current user set isn't already exactly {target}. As of 2026-07-31, any
     *other* currently-assigned user with a resolvable email/userId is no
@@ -89,13 +110,19 @@ For each in-scope resource:
     split to and is still just dropped. If any split creation fails, the
     original resource is left untouched rather than pruning access with
     nowhere for it to have gone.
-  - Roles/clients are read (for the report) but never modified: every
-    resource surveyed in this org -- both hand-created legacy ones and
-    ones already produced by create_private_resources.py -- uniformly
-    carries only the org's baseline "Admin" role and zero clients, which
-    looks like server-side default behavior rather than per-resource state
-    either script manages. A resource with anything else attached is
-    flagged as an anomaly in the report rather than silently touched.
+  - Roles are read (for the report) but never modified. Confirmed live
+    2026-08-04: every resource's baseline "Admin" role (roleId 1, isAdmin
+    true -- Pangolin's own built-in super-admin role, not a real per-resource
+    grant, which is why it never shows up under a resource's own Roles tab in
+    the dashboard) comes back from GET /site-resource/{id}/roles listed
+    *twice*, identical entries -- not two different roles. Any number of
+    repeated "Admin"-only entries is treated as this same expected baseline;
+    only a role name other than "Admin" appearing is flagged as an anomaly
+    in the report (still never auto-fixed, review manually). Clients are
+    still fetched internally (needed to echo back `clientIds` unchanged on
+    every update, same reasoning as the tcp/udp/icmp bullet below) but no
+    longer reported or checked -- every resource observed has had zero, and
+    it's not a grant type either script manages.
   - tcpPortRangeString/udpPortRangeString/disableIcmp are read but never
     intentionally changed by this script -- however, every POST update
     call re-asserts the resource's own current values for these explicitly.
@@ -256,6 +283,10 @@ def create_split_resource(cfg, sites, res, city, vlan, tail, ports, email, user_
         "clientIds": [],
         "userIds": [user_id],
         "siteIds": [s["siteId"] for s in sites],
+        # Target is already fully resolved at this point (same reasoning as
+        # create_private_resources.py enabling on a matched email) -- no
+        # reason to create this split-off resource disabled.
+        "enabled": True,
     }
     if ports is not None:
         payload["niceId"] = compute_expected_nice_id(username, vlan, tail, ports)
@@ -471,12 +502,14 @@ def resolve_target(name, users, org_email_index):
 
 def process_resource(cfg, sites, res, org_email_index, apply_changes):
     resource_id = res["siteResourceId"]
+    current_enabled = res.get("enabled", True)
     row = {
         "resource_id": resource_id, "nice_id": res.get("niceId"), "new_nice_id": res.get("niceId"),
         "mode": res["mode"],
         "destination": res["destination"], "city": None, "target_email": None,
         "old_name": res["name"], "new_name": res["name"], "action": "none",
-        "removed_users": None, "current_users": None, "roles": None, "clients": None,
+        "removed_users": None, "current_users": None, "roles": None,
+        "enabled": current_enabled, "new_enabled": current_enabled,
         "status": None, "reason": None,
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -508,13 +541,14 @@ def process_resource(cfg, sites, res, org_email_index, apply_changes):
                                       for u in users) or "(none)"
 
     roles = get_resource_roles(cfg, resource_id)
+    # Not reported/checked -- fetched only to echo clientIds back unchanged on
+    # any update below (same reasoning as tcp/udp/icmp), never anything else.
     clients = get_resource_clients(cfg, resource_id)
     role_names = sorted(r["name"] for r in roles)
     row["roles"] = ", ".join(role_names) or "(none)"
-    row["clients"] = str(len(clients))
     notes = []
-    if role_names != ["Admin"] or clients:
-        notes.append(f"unexpected roles/clients (roles={role_names}, clients={len(clients)}) "
+    if any(name != "Admin" for name in role_names):
+        notes.append(f"unexpected role(s) attached (roles={role_names}) "
                       f"-- not modified, review manually")
     if ports is None:
         notes.append(f"niceId not checked: tcpPortRangeString "
@@ -547,11 +581,45 @@ def process_resource(cfg, sites, res, org_email_index, apply_changes):
             res["name"], users, org_email_index)
 
     if unresolved_reason:
-        row["status"] = "SKIPPED"
-        row["reason"] = unresolved_reason + (f" -- org directory suggests: {suggestion}"
-                                              if suggestion else "")
+        reason = unresolved_reason + (f" -- org directory suggests: {suggestion}" if suggestion else "")
         if notes:
-            row["reason"] += "; " + "; ".join(notes)
+            reason += "; " + "; ".join(notes)
+        row["reason"] = reason
+
+        if len(users) == 0 and current_enabled:
+            # No resolvable owner and still enabled -- this resource's
+            # baseline Admin-role default access (see CLAUDE.md) is reachable
+            # by anyone holding that role while it sits unowned. Disable it
+            # until a future run resolves a real target: the mirror image of
+            # create_private_resources.py creating an OK_NO_USER resource
+            # disabled from the start.
+            row["action"] = "disable_no_user"
+            row["new_enabled"] = False
+            if not apply_changes:
+                row["status"] = "DRY-RUN"
+                return row
+            try:
+                update_resource(cfg, resource_id, {
+                    "enabled": False,
+                    "userIds": [],
+                    "roleIds": [r["roleId"] for r in roles],
+                    "clientIds": [c["clientId"] for c in clients],
+                    "destination": res["destination"],
+                    "siteIds": res["siteIds"],
+                    "tcpPortRangeString": res.get("tcpPortRangeString") or "",
+                    "udpPortRangeString": res.get("udpPortRangeString") or "",
+                    "disableIcmp": res.get("disableIcmp", True),
+                })
+                row["status"] = "OK"
+            except requests.HTTPError as e:
+                row["status"] = "FAIL"
+                row["reason"] = f"{e.response.status_code}: {e.response.text[:400]}"
+            return row
+
+        # Already disabled (nothing to do) or ambiguous among 2+ already-
+        # assigned users (not an "unassigned" resource -- enabled is left
+        # alone, only the 0-user axis ever touches it here).
+        row["status"] = "SKIPPED"
         return row
 
     row["target_email"] = target_email
@@ -566,6 +634,13 @@ def process_resource(cfg, sites, res, org_email_index, apply_changes):
     needs_nice_id_fix = expected_nice_id is not None and expected_nice_id != (res.get("niceId") or "")
     current_ids = {u.get("userId") for u in users if u.get("userId")}
     needs_access_fix = current_ids != {target_user_id}
+    # A resolved target always means access is being granted or confirmed --
+    # this resource should be (or become) enabled, whether it's the 0-user
+    # transition create_private_resources.py left disabled, or an
+    # already-assigned resource that was somehow left disabled anyway.
+    needs_enable_fix = not current_enabled
+    if needs_enable_fix:
+        row["new_enabled"] = True
 
     # As of 2026-07-31: a user other than the resolved target no longer just
     # loses access when this resource gets pruned down to one owner -- they
@@ -586,7 +661,7 @@ def process_resource(cfg, sites, res, org_email_index, apply_changes):
 
     reason = "; ".join(notes) or None
 
-    if not needs_rename and not needs_nice_id_fix and not needs_access_fix:
+    if not needs_rename and not needs_nice_id_fix and not needs_access_fix and not needs_enable_fix:
         row["status"] = "OK"
         row["reason"] = reason
         return row
@@ -596,6 +671,8 @@ def process_resource(cfg, sites, res, org_email_index, apply_changes):
         actions.append("rename")
     if needs_nice_id_fix:
         actions.append("fix_nice_id")
+    if needs_enable_fix:
+        actions.append("enable")
     if needs_access_fix:
         actions.append("grant_access" if len(users) == 0 else
                         ("split_access" if split_off_users else "prune_access"))
@@ -621,12 +698,12 @@ def process_resource(cfg, sites, res, org_email_index, apply_changes):
                 f"<no-email:{u}> -> dropped (no email to split to)" for u in unsplittable_users
             ])
 
-        update_fields = {}
-        if needs_rename:
-            update_fields["name"] = expected_name
-        if needs_nice_id_fix:
-            update_fields["niceId"] = expected_nice_id
-        if update_fields:
+        if needs_rename or needs_nice_id_fix or needs_enable_fix:
+            update_fields = {}
+            if needs_rename:
+                update_fields["name"] = expected_name
+            if needs_nice_id_fix:
+                update_fields["niceId"] = expected_nice_id
             # Despite the swagger schema showing every field optional, this
             # endpoint validates as if the whole resource were being
             # resubmitted -- userIds/roleIds/clientIds/destination/siteIds
@@ -650,6 +727,13 @@ def process_resource(cfg, sites, res, org_email_index, apply_changes):
             update_fields["tcpPortRangeString"] = res.get("tcpPortRangeString") or ""
             update_fields["udpPortRangeString"] = res.get("udpPortRangeString") or ""
             update_fields["disableIcmp"] = res.get("disableIcmp", True)
+            # Reaching this branch always means a target is resolved (access
+            # is being granted or confirmed), so the resource belongs
+            # enabled -- always assert it explicitly here rather than only
+            # when needs_enable_fix triggered this update, on the same
+            # "don't trust omitted-field defaults" precedent as tcp/udp/icmp
+            # above.
+            update_fields["enabled"] = True
             update_resource(cfg, resource_id, update_fields)
         if needs_access_fix:
             set_resource_users(cfg, resource_id, [target_user_id])
@@ -666,9 +750,9 @@ def write_report(rows, out_path):
     ws = wb.active
     ws.title = "Normalize Report"
 
-    headers = ["SiteResourceId", "NiceId", "NewNiceId", "Mode", "Destination", "City",
-               "TargetEmail", "OldName", "NewName", "Action", "RemovedUsers", "CurrentUsers",
-               "Roles", "Clients", "Status", "Reason", "Timestamp"]
+    headers = ["SiteResourceId", "NiceId", "NewNiceId", "Enabled", "NewEnabled", "Mode",
+               "Destination", "City", "TargetEmail", "OldName", "NewName", "Action",
+               "RemovedUsers", "CurrentUsers", "Roles", "Status", "Reason", "Timestamp"]
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
     for c, h in enumerate(headers, start=1):
@@ -678,20 +762,22 @@ def write_report(rows, out_path):
         cell.alignment = Alignment(horizontal="center")
 
     status_colors = {"OK": "C6EFCE", "FAIL": "FFC7CE", "DRY-RUN": "FFEB9C", "SKIPPED": "D9D9D9"}
+    status_col = headers.index("Status") + 1
     for r, row in enumerate(rows, start=2):
         values = [
-            row["resource_id"], row["nice_id"], row["new_nice_id"], row["mode"],
-            row["destination"], row["city"], row["target_email"], row["old_name"],
-            row["new_name"], row["action"], row["removed_users"], row["current_users"],
-            row["roles"], row["clients"], row["status"], row["reason"], row["timestamp"],
+            row["resource_id"], row["nice_id"], row["new_nice_id"], row["enabled"],
+            row["new_enabled"], row["mode"], row["destination"], row["city"],
+            row["target_email"], row["old_name"], row["new_name"], row["action"],
+            row["removed_users"], row["current_users"], row["roles"],
+            row["status"], row["reason"], row["timestamp"],
         ]
         for c, v in enumerate(values, start=1):
             ws.cell(row=r, column=c, value=v)
         fill_color = status_colors.get(row["status"])
         if fill_color:
-            ws.cell(row=r, column=15).fill = PatternFill("solid", fgColor=fill_color)
+            ws.cell(row=r, column=status_col).fill = PatternFill("solid", fgColor=fill_color)
 
-    widths = [8, 26, 26, 6, 16, 12, 24, 24, 24, 18, 26, 30, 12, 8, 10, 50, 18]
+    widths = [8, 26, 26, 8, 10, 6, 16, 12, 24, 24, 24, 18, 26, 30, 12, 10, 50, 18]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
 
@@ -739,6 +825,7 @@ def main():
             print(f"  [{row['status']}] siteResourceId={row['resource_id']} "
                   f"'{row['old_name']}' -> '{row['new_name']}' "
                   f"niceId '{row['nice_id']}' -> '{row['new_nice_id']}' "
+                  f"enabled {row['enabled']} -> {row['new_enabled']} "
                   f"action={row['action']} reason={row['reason'] or '-'}")
 
     counts = {}
